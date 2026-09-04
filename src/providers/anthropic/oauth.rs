@@ -296,11 +296,14 @@ impl<H: HttpClient> AnthropicOAuth<H> {
             ));
         }
 
-        // RFC 6749 §4.1.3: the code exchange carries the verifier, not the
-        // state; state is a redirect-only CSRF guard, checked above.
+        // The token endpoint requires the CSRF state echoed back in the exchange
+        // body; a request without it is rejected as an invalid request format.
+        // Prefer the state returned with the code, falling back to the login's.
+        let state = code.state.as_deref().unwrap_or(&login.state);
         let body = serde_json::json!({
             "grant_type": "authorization_code",
             "code": code.code,
+            "state": state,
             "client_id": self.client_id,
             "redirect_uri": login.redirect_uri,
             "code_verifier": login.verifier,
@@ -927,9 +930,35 @@ mod tests {
             serde_json::from_slice(sent.body.as_deref().unwrap()).unwrap();
         assert_eq!(body["grant_type"], "authorization_code");
         assert_eq!(body["code"], "auth-code");
+        // The token endpoint rejects a body without the echoed CSRF state.
+        assert_eq!(body["state"], "the-state");
         assert_eq!(body["code_verifier"], RFC7636_VERIFIER);
         assert_eq!(body["redirect_uri"], "http://localhost:8484/callback");
         assert_eq!(body["client_id"], "test-client");
+    }
+
+    #[tokio::test]
+    async fn exchange_falls_back_to_the_login_state_when_the_code_omits_it() {
+        let mock =
+            Arc::new(MockHttpClient::with_response(200, token_body(true)));
+        let flow = oauth(mock.clone());
+        let login = flow.build_login(
+            OAuthMode::Subscription,
+            &Redirect::Manual,
+            RFC7636_VERIFIER.to_owned(),
+            "login-state".to_owned(),
+        );
+        let code = AuthorizationCode {
+            code: "auth-code".to_owned(),
+            state: None,
+        };
+
+        flow.exchange(&login, &code).await.unwrap();
+
+        let sent = mock.last_request();
+        let body: serde_json::Value =
+            serde_json::from_slice(sent.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["state"], "login-state");
     }
 
     #[tokio::test]
