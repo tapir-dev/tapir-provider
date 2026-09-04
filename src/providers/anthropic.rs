@@ -68,11 +68,21 @@ pub struct AnthropicProvider<H> {
 impl<H: HttpClient> AnthropicProvider<H> {
     /// Build a Provider for the given Model, authenticating with `credential`
     /// over the injected transport.
+    ///
+    /// The explicit `credential` is resolution's top tier, so this routes it
+    /// through the same [`resolve`] rule every construction path uses: an
+    /// explicit argument never consults the store or environment, so this is
+    /// infallible.
     pub fn new(
         http: H,
         credential: Credential,
         model: impl Into<String>,
     ) -> Self {
+        let credential =
+            resolve(Some(credential), None, PROVIDER_KEY, API_KEY_ENV)
+                .ok()
+                .flatten()
+                .expect("an explicit Credential always resolves");
         Self {
             http,
             credential,
@@ -99,7 +109,9 @@ impl<H: HttpClient> AnthropicProvider<H> {
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::Authentication,
-                    "no Anthropic Credential: pass one, store it under \"anthropic\", or set ANTHROPIC_API_KEY",
+                    format!(
+                        "no Anthropic Credential: pass one, store it under {PROVIDER_KEY:?}, or set {API_KEY_ENV}"
+                    ),
                 )
             })?;
         Ok(Self::new(http, credential, model))
