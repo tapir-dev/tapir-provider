@@ -54,8 +54,9 @@ pub mod request;
 pub mod response;
 pub mod sse;
 pub mod stream;
+pub mod token_store;
 
-pub use credential::Credential;
+pub use credential::{Credential, OAuthTokens};
 pub use error::{Error, ErrorKind};
 pub use http::{ByteStream, HttpClient, HttpRequest, HttpResponse, Method};
 pub use message::{ContentPart, ImageSource, MediaType, Message, Role};
@@ -64,6 +65,7 @@ pub use request::{CompletionRequest, ToolChoice, ToolDefinition};
 pub use response::{CompletionResponse, FinishReason, ToolCall, Usage};
 pub use sse::{SseDecoder, SseEvent};
 pub use stream::{StreamAccumulator, StreamEvent, StreamEvents};
+pub use token_store::{InMemoryTokenStore, TokenStore, resolve};
 
 #[cfg(feature = "anthropic")]
 pub use providers::AnthropicProvider;

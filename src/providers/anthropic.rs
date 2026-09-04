@@ -14,6 +14,7 @@ use crate::response::{
 };
 use crate::sse::{SseDecoder, SseEvent};
 use crate::stream::{StreamEvent, StreamEvents};
+use crate::token_store::{TokenStore, resolve};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -23,6 +24,10 @@ use std::task::{Context, Poll};
 
 /// Default base URL for the Anthropic API.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+/// Provider id this Anthropic Provider keys its Credential under in a Token Store.
+const PROVIDER_KEY: &str = "anthropic";
+/// Environment variable holding an Anthropic API key, the last-resort Credential.
+const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// Anthropic API version header value pinned by this crate.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; use this when the request leaves it unset.
@@ -74,6 +79,30 @@ impl<H: HttpClient> AnthropicProvider<H> {
             model: model.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
         }
+    }
+
+    /// Build a Provider by resolving its Credential from a Token Store, then
+    /// the `ANTHROPIC_API_KEY` environment variable.
+    ///
+    /// Precedence follows [`resolve`]: an `explicit` Credential wins, else the
+    /// `store` under this Provider's key, else the environment. When every tier
+    /// is empty this is an
+    /// [`Authentication`](crate::ErrorKind::Authentication) error rather than a
+    /// Provider that cannot authenticate any request.
+    pub fn resolve(
+        http: H,
+        model: impl Into<String>,
+        explicit: Option<Credential>,
+        store: Option<&dyn TokenStore>,
+    ) -> Result<Self, Error> {
+        let credential = resolve(explicit, store, PROVIDER_KEY, API_KEY_ENV)?
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Authentication,
+                    "no Anthropic Credential: pass one, store it under \"anthropic\", or set ANTHROPIC_API_KEY",
+                )
+            })?;
+        Ok(Self::new(http, credential, model))
     }
 
     /// Override the base URL (for proxies, gateways, or a test server).
@@ -727,6 +756,42 @@ mod tests {
         assert_eq!(response.usage.output_tokens, 5);
         assert_eq!(response.finish_reason, FinishReason::Stop);
         assert_eq!(response.raw["id"], "msg_123");
+    }
+
+    #[tokio::test]
+    async fn resolves_api_key_from_the_token_store_and_completes() {
+        use crate::token_store::InMemoryTokenStore;
+
+        let store = InMemoryTokenStore::new();
+        store
+            .set(PROVIDER_KEY, Credential::api_key("sk-stored"))
+            .unwrap();
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::resolve(
+            mock.clone(),
+            "claude-3-5-sonnet",
+            None,
+            Some(&store),
+        )
+        .unwrap();
+
+        let response = provider
+            .complete(CompletionRequest::new(vec![Message::user("Hello")]))
+            .await
+            .unwrap();
+
+        // Same completion as the explicit-Credential path, and the resolved
+        // key is what reached the wire.
+        assert_eq!(response.text, "Hello there!");
+        assert!(
+            mock.last_request()
+                .headers
+                .iter()
+                .any(|(k, v)| k == "x-api-key" && v == "sk-stored")
+        );
     }
 
     #[tokio::test]
