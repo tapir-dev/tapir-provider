@@ -357,6 +357,16 @@ impl<H: HttpClient> AnthropicOAuth<H> {
     }
 }
 
+/// Renews a stored OAuth token for the [`TokenStore`](crate::TokenStore)'s
+/// proactive refresh, delegating to the inherent
+/// [`refresh`](AnthropicOAuth::refresh).
+#[async_trait::async_trait]
+impl<H: HttpClient> crate::token_store::Refresh for AnthropicOAuth<H> {
+    async fn refresh(&self, refresh_token: &str) -> Result<Credential, Error> {
+        AnthropicOAuth::refresh(self, refresh_token).await
+    }
+}
+
 /// Block on `port` until the browser redirect arrives, returning the captured
 /// [`AuthorizationCode`].
 ///

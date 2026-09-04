@@ -14,6 +14,9 @@ default = ["reqwest"]
 reqwest = ["dep:reqwest"]
 # Compile the Anthropic Provider into the crate.
 anthropic = ["dep:getrandom"]
+# File-backed Token Store that serializes Credentials as TOML, guarded by an
+# OS file lock so concurrent processes coordinate reads, writes, and refresh.
+token-store-file = ["dep:toml", "dep:fs4"]
 # In-crate HttpClient test double for driving Providers without a network.
 test-utils = []
 
@@ -28,6 +31,12 @@ getrandom = { version = "0.2", optional = true }
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "stream",
+], optional = true }
+# TOML (de)serialization for the file-backed Token Store.
+toml = { version = "0.8", optional = true }
+# OS-level file locking so concurrent processes coordinate on the store file.
+fs4 = { version = "1", default-features = false, features = [
+    "sync",
 ], optional = true }
 
 [dev-dependencies]

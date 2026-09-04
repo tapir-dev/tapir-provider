@@ -65,7 +65,9 @@ pub use request::{CompletionRequest, ToolChoice, ToolDefinition};
 pub use response::{CompletionResponse, FinishReason, ToolCall, Usage};
 pub use sse::{SseDecoder, SseEvent};
 pub use stream::{StreamAccumulator, StreamEvent, StreamEvents};
-pub use token_store::{InMemoryTokenStore, TokenStore, resolve};
+#[cfg(feature = "token-store-file")]
+pub use token_store::{DEFAULT_REFRESH_WINDOW_SECS, FileTokenStore};
+pub use token_store::{InMemoryTokenStore, Refresh, TokenStore, resolve};
 
 #[cfg(feature = "anthropic")]
 pub use providers::AnthropicProvider;
