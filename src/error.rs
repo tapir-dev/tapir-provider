@@ -5,6 +5,7 @@
 
 use std::error::Error as StdError;
 use std::fmt;
+use std::time::Duration;
 
 /// A coarse classification of what went wrong, stable enough for callers to
 /// branch on without parsing messages.
@@ -81,6 +82,7 @@ pub struct Error {
     kind: ErrorKind,
     message: String,
     status: Option<u16>,
+    retry_after: Option<Duration>,
     source: Option<Box<dyn StdError + Send + Sync>>,
 }
 
@@ -91,6 +93,7 @@ impl Error {
             kind,
             message: message.into(),
             status: None,
+            retry_after: None,
             source: None,
         }
     }
@@ -102,8 +105,19 @@ impl Error {
             kind: ErrorKind::from_status(status),
             message: message.into(),
             status: Some(status),
+            retry_after: None,
             source: None,
         }
+    }
+
+    /// Attach a server-requested retry delay, as from a `Retry-After` header.
+    ///
+    /// The [`RetryProvider`](crate::retry::RetryProvider) honors this over its
+    /// computed backoff when deciding how long to wait before the next attempt.
+    #[must_use]
+    pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
+        self.retry_after = Some(retry_after);
+        self
     }
 
     /// Attach an underlying source error.
@@ -138,6 +152,12 @@ impl Error {
         self.status
     }
 
+    /// The server-requested retry delay, if one was attached.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
     /// The human-readable message.
     #[must_use]
     pub fn message(&self) -> &str {
@@ -161,6 +181,7 @@ impl fmt::Debug for Error {
             .field("kind", &self.kind)
             .field("message", &self.message)
             .field("status", &self.status)
+            .field("retry_after", &self.retry_after)
             .field("source", &self.source)
             .finish()
     }

@@ -42,6 +42,26 @@ pub trait Provider: Send + Sync {
     }
 }
 
+/// Forward through a shared handle so an `Arc<P>` (or `Arc<dyn Provider>`) is
+/// itself a Provider, letting a decorator or a test hold onto the inner
+/// Provider while it is also driven through the trait.
+#[async_trait]
+impl<T: Provider + ?Sized> Provider for std::sync::Arc<T> {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse, Error> {
+        (**self).complete(request).await
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamEvents, Error> {
+        (**self).complete_stream(request).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

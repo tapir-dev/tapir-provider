@@ -24,6 +24,7 @@ use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 /// Default base URL for the Anthropic API.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -208,10 +209,12 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
         let response = self.http.send(http_request).await?;
 
         if !response.is_success() {
-            return Err(Error::from_status(
-                response.status,
-                response.body_string(),
-            ));
+            let error =
+                Error::from_status(response.status, response.body_string());
+            return Err(match parse_retry_after(&response.headers) {
+                Some(delay) => error.with_retry_after(delay),
+                None => error,
+            });
         }
 
         let wire: WireResponse =
@@ -796,6 +799,20 @@ struct WireUsage {
     output_tokens: u32,
 }
 
+/// Parse a `Retry-After` header as a whole number of seconds.
+///
+/// The Anthropic API reports the delay in `delay-seconds` form; the HTTP-date
+/// form is not emitted here, so it is not parsed. An absent, non-numeric, or
+/// oversized value yields `None`, letting the retry decorator fall back to its
+/// own backoff.
+fn parse_retry_after(headers: &[(String, String)]) -> Option<Duration> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
 fn map_finish_reason(stop_reason: Option<String>) -> FinishReason {
     match stop_reason.as_deref() {
         Some("end_turn") => FinishReason::Stop,
@@ -1333,6 +1350,42 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.kind(), kind, "status {status}");
         }
+    }
+
+    #[tokio::test]
+    async fn retry_after_header_is_attached_to_the_error() {
+        let mock = std::sync::Arc::new(MockHttpClient::new());
+        mock.push_response(crate::http::HttpResponse {
+            status: 429,
+            headers: vec![("Retry-After".to_owned(), "7".to_owned())],
+            body: b"{}".to_vec(),
+        });
+        let provider = AnthropicProvider::new(
+            mock,
+            Credential::api_key("k"),
+            "claude-3-5-sonnet",
+        );
+
+        let err = provider
+            .complete(CompletionRequest::new(vec![Message::user("hi")]))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::RateLimited);
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn parse_retry_after_reads_delay_seconds_case_insensitively() {
+        let headers = vec![("retry-after".to_owned(), " 12 ".to_owned())];
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(12)));
+        // An HTTP-date form is not parsed.
+        let dated = vec![(
+            "Retry-After".to_owned(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_owned(),
+        )];
+        assert_eq!(parse_retry_after(&dated), None);
+        assert_eq!(parse_retry_after(&[]), None);
     }
 
     #[tokio::test]

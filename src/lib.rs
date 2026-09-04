@@ -52,6 +52,7 @@ pub mod provider;
 pub mod providers;
 pub mod request;
 pub mod response;
+pub mod retry;
 pub mod sse;
 pub mod stream;
 pub mod token_store;
@@ -63,6 +64,7 @@ pub use message::{ContentPart, ImageSource, MediaType, Message, Role};
 pub use provider::Provider;
 pub use request::{CompletionRequest, ToolChoice, ToolDefinition};
 pub use response::{CompletionResponse, FinishReason, ToolCall, Usage};
+pub use retry::{Clock, RetryPolicy, RetryProvider, SystemClock};
 pub use sse::{SseDecoder, SseEvent};
 pub use stream::{StreamAccumulator, StreamEvent, StreamEvents};
 #[cfg(feature = "token-store-file")]
