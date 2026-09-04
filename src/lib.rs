@@ -58,7 +58,7 @@ pub mod stream;
 pub use credential::Credential;
 pub use error::{Error, ErrorKind};
 pub use http::{ByteStream, HttpClient, HttpRequest, HttpResponse, Method};
-pub use message::{Message, Role};
+pub use message::{ContentPart, ImageSource, MediaType, Message, Role};
 pub use provider::Provider;
 pub use request::{CompletionRequest, ToolChoice, ToolDefinition};
 pub use response::{CompletionResponse, FinishReason, ToolCall, Usage};

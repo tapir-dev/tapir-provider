@@ -6,7 +6,7 @@
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
 use crate::http::{ByteStream, HttpClient, HttpRequest, Method};
-use crate::message::Role;
+use crate::message::{ContentPart, ImageSource, Role};
 use crate::provider::Provider;
 use crate::request::{CompletionRequest, ToolChoice, ToolDefinition};
 use crate::response::{
@@ -16,6 +16,7 @@ use crate::sse::{SseDecoder, SseEvent};
 use crate::stream::{StreamEvent, StreamEvents};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -379,14 +380,22 @@ impl<'a> WireRequest<'a> {
 
         for message in &request.messages {
             match message.role {
-                Role::System => system_parts.push(message.content.as_str()),
+                Role::System => {
+                    // Anthropic's `system` field is text-only; drop any
+                    // non-text parts in a system message.
+                    for part in &message.content {
+                        if let ContentPart::Text(text) = part {
+                            system_parts.push(text.as_str());
+                        }
+                    }
+                }
                 Role::User => messages.push(WireMessage {
                     role: "user",
-                    content: &message.content,
+                    content: wire_content(&message.content),
                 }),
                 Role::Assistant => messages.push(WireMessage {
                     role: "assistant",
-                    content: &message.content,
+                    content: wire_content(&message.content),
                 }),
             }
         }
@@ -446,7 +455,106 @@ fn wire_tool_choice(choice: &ToolChoice) -> serde_json::Value {
 #[derive(Debug, Serialize)]
 struct WireMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: WireContent<'a>,
+}
+
+/// A message's content on the wire.
+///
+/// Anthropic accepts either a plain string or an array of typed blocks. A
+/// message that is a single text part serializes as the string form, keeping
+/// the common case compact; anything else (images, or multiple parts)
+/// serializes as blocks.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum WireContent<'a> {
+    Text(&'a str),
+    Blocks(Vec<WireContentPart<'a>>),
+}
+
+/// One content block in the Anthropic request body.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum WireContentPart<'a> {
+    Text { text: &'a str },
+    Image { source: WireImageSource<'a> },
+}
+
+/// An image block's `source` in the Anthropic request body.
+///
+/// Raw bytes are base64-encoded into the same shape as an inline base64 image,
+/// so both carry a `media_type`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum WireImageSource<'a> {
+    Url {
+        url: &'a str,
+    },
+    Base64 {
+        media_type: &'static str,
+        data: Cow<'a, str>,
+    },
+}
+
+/// Map neutral content parts onto Anthropic's message content.
+fn wire_content(parts: &[ContentPart]) -> WireContent<'_> {
+    if let [ContentPart::Text(text)] = parts {
+        return WireContent::Text(text.as_str());
+    }
+    WireContent::Blocks(parts.iter().map(wire_content_part).collect())
+}
+
+/// Map one neutral content part onto an Anthropic content block.
+fn wire_content_part(part: &ContentPart) -> WireContentPart<'_> {
+    match part {
+        ContentPart::Text(text) => WireContentPart::Text { text },
+        ContentPart::Image(source) => WireContentPart::Image {
+            source: wire_image_source(source),
+        },
+    }
+}
+
+/// Map a neutral image source onto Anthropic's image `source` object.
+fn wire_image_source(source: &ImageSource) -> WireImageSource<'_> {
+    match source {
+        ImageSource::Url(url) => WireImageSource::Url { url },
+        ImageSource::Base64 { media_type, data } => WireImageSource::Base64 {
+            media_type: media_type.as_wire(),
+            data: Cow::Borrowed(data),
+        },
+        ImageSource::Bytes { media_type, data } => WireImageSource::Base64 {
+            media_type: media_type.as_wire(),
+            data: Cow::Owned(base64_encode(data)),
+        },
+    }
+}
+
+/// Standard base64-encode (RFC 4648) with padding, no line breaks.
+///
+/// Hand-rolled to keep the crate's dependency set minimal; raw-bytes images
+/// are the only caller.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// The Anthropic response body.
@@ -536,9 +644,25 @@ fn map_finish_reason(stop_reason: Option<String>) -> FinishReason {
 mod tests {
     use super::*;
     use crate::http::MockHttpClient;
-    use crate::message::Message;
+    use crate::message::{MediaType, Message};
     use crate::stream::StreamAccumulator;
     use futures_util::StreamExt;
+
+    /// Send one request and return its parsed JSON body.
+    async fn sent_body(request: CompletionRequest) -> serde_json::Value {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+        provider.complete(request).await.unwrap();
+        serde_json::from_slice(mock.last_request().body.as_deref().unwrap())
+            .unwrap()
+    }
 
     /// A full Anthropic message stream: a text block, then usage and stop.
     const SAMPLE_STREAM: &str = concat!(
@@ -711,6 +835,67 @@ mod tests {
         .unwrap();
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[tokio::test]
+    async fn url_image_and_text_mix_within_one_user_message() {
+        let request = CompletionRequest::new(vec![
+            Message::user("what is this?")
+                .with_image(ImageSource::url("https://example.com/cat.png")),
+        ]);
+        let body = sent_body(request).await;
+
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is this?");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "url");
+        assert_eq!(content[1]["source"]["url"], "https://example.com/cat.png");
+    }
+
+    #[tokio::test]
+    async fn base64_image_carries_its_media_type_to_the_wire() {
+        let request = CompletionRequest::new(vec![Message::from_parts(
+            Role::User,
+            vec![ContentPart::image(ImageSource::base64(
+                MediaType::Jpeg,
+                "aGk=",
+            ))],
+        )]);
+        let body = sent_body(request).await;
+
+        let source = &body["messages"][0]["content"][0]["source"];
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["media_type"], "image/jpeg");
+        assert_eq!(source["data"], "aGk=");
+    }
+
+    #[tokio::test]
+    async fn raw_bytes_image_is_base64_encoded_with_media_type() {
+        let request = CompletionRequest::new(vec![Message::from_parts(
+            Role::User,
+            vec![ContentPart::image(ImageSource::bytes(
+                MediaType::Png,
+                b"hi".to_vec(),
+            ))],
+        )]);
+        let body = sent_body(request).await;
+
+        let source = &body["messages"][0]["content"][0]["source"];
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["media_type"], "image/png");
+        // "hi" base64-encodes to "aGk=".
+        assert_eq!(source["data"], "aGk=");
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Many"), "TWFueQ==");
+        assert_eq!(base64_encode(b"Manag"), "TWFuYWc=");
     }
 
     #[tokio::test]
