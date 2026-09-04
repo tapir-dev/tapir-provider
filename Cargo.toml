@@ -13,7 +13,7 @@ default = ["reqwest"]
 # Default reqwest-backed HttpClient transport.
 reqwest = ["dep:reqwest"]
 # Compile the Anthropic Provider into the crate.
-anthropic = []
+anthropic = ["dep:getrandom"]
 # In-crate HttpClient test double for driving Providers without a network.
 test-utils = []
 
@@ -23,6 +23,8 @@ futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Cryptographic entropy for the OAuth PKCE verifier and CSRF state.
+getrandom = { version = "0.2", optional = true }
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "stream",

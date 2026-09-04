@@ -69,3 +69,8 @@ pub use token_store::{InMemoryTokenStore, TokenStore, resolve};
 
 #[cfg(feature = "anthropic")]
 pub use providers::AnthropicProvider;
+#[cfg(feature = "anthropic")]
+pub use providers::anthropic::oauth::{
+    AnthropicOAuth, AuthorizationCode, OAuthLogin, OAuthMode, Redirect,
+    capture_localhost,
+};

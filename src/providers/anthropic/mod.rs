@@ -3,6 +3,8 @@
 
 //! The Anthropic [`Provider`], authenticating with an `x-api-key` Credential.
 
+pub mod oauth;
+
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
 use crate::http::{ByteStream, HttpClient, HttpRequest, Method};
@@ -141,9 +143,7 @@ impl<H: HttpClient> AnthropicProvider<H> {
             request,
             streaming,
         ))
-        .map_err(|err| {
-            Error::new(ErrorKind::Other, err.to_string()).with_source(err)
-        })?;
+        .map_err(Error::serialize)?;
 
         let url =
             format!("{}/v1/messages", self.base_url.trim_end_matches('/'));

@@ -121,6 +121,11 @@ impl Error {
         Self::new(ErrorKind::Decode, source.to_string()).with_source(source)
     }
 
+    /// Construct a [`ErrorKind::Other`] error from a serialization failure.
+    pub fn serialize(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::new(ErrorKind::Other, source.to_string()).with_source(source)
+    }
+
     /// The error's classification.
     #[must_use]
     pub const fn kind(&self) -> ErrorKind {
