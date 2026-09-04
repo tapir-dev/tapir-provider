@@ -50,6 +50,7 @@ pub mod http;
 pub mod message;
 pub mod provider;
 pub mod providers;
+pub mod registry;
 pub mod request;
 pub mod response;
 pub mod retry;
@@ -62,6 +63,7 @@ pub use error::{Error, ErrorKind};
 pub use http::{ByteStream, HttpClient, HttpRequest, HttpResponse, Method};
 pub use message::{ContentPart, ImageSource, MediaType, Message, Role};
 pub use provider::Provider;
+pub use registry::{ProviderInfo, Registry};
 pub use request::{CompletionRequest, ToolChoice, ToolDefinition};
 pub use response::{CompletionResponse, FinishReason, ToolCall, Usage};
 pub use retry::{Clock, RetryPolicy, RetryProvider, SystemClock};
@@ -72,9 +74,9 @@ pub use token_store::{DEFAULT_REFRESH_WINDOW_SECS, FileTokenStore};
 pub use token_store::{InMemoryTokenStore, Refresh, TokenStore, resolve};
 
 #[cfg(feature = "anthropic")]
-pub use providers::AnthropicProvider;
-#[cfg(feature = "anthropic")]
 pub use providers::anthropic::oauth::{
     AnthropicOAuth, AuthorizationCode, OAuthLogin, OAuthMode, Redirect,
     capture_localhost,
 };
+#[cfg(feature = "anthropic")]
+pub use providers::{AnthropicBuilder, AnthropicProvider};

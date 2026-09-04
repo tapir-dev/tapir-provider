@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
+use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -29,9 +30,20 @@ use std::time::Duration;
 /// Default base URL for the Anthropic API.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// Provider id this Anthropic Provider keys its Credential under in a Token Store.
-const PROVIDER_KEY: &str = "anthropic";
+pub(crate) const PROVIDER_KEY: &str = "anthropic";
 /// Environment variable holding an Anthropic API key, the last-resort Credential.
-const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+pub(crate) const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+/// Alternate names that select this Provider in the [`Registry`](crate::Registry).
+pub(crate) const ALIASES: &[&str] = &["claude"];
+
+/// This Provider's identity in the [`Registry`](crate::Registry): its canonical
+/// id, the alternate names that select it, and the environment variable holding
+/// its default API key.
+pub const INFO: crate::registry::ProviderInfo = crate::registry::ProviderInfo {
+    id: PROVIDER_KEY,
+    aliases: ALIASES,
+    api_key_env: API_KEY_ENV,
+};
 /// Anthropic API version header value pinned by this crate.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; use this when the request leaves it unset.
@@ -95,12 +107,38 @@ impl AuthLane {
 /// The transport is injected as the generic `H`, which erases to
 /// `Arc<dyn Provider>` at registration. The addressable Model is fixed when the
 /// Provider is built.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnthropicProvider<H> {
     http: H,
     credential: Credential,
     model: String,
     base_url: String,
+    /// Caller-supplied headers appended to every request, after the Provider's
+    /// own auth and version headers. For proxies and gateways that key off a
+    /// bespoke header.
+    extra_headers: Vec<(String, String)>,
+}
+
+/// Redacts header *values*, keeping names visible: a caller-supplied header may
+/// carry a secret (a proxy authorization token), so its value never reaches
+/// Debug output — matching the crate's [`Credential`] redaction discipline.
+fn redacted_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+    headers
+        .iter()
+        .map(|(name, _)| (name.as_str(), "<redacted>"))
+        .collect()
+}
+
+impl<H: fmt::Debug> fmt::Debug for AnthropicProvider<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnthropicProvider")
+            .field("http", &self.http)
+            .field("credential", &self.credential)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("extra_headers", &redacted_headers(&self.extra_headers))
+            .finish()
+    }
 }
 
 impl<H: HttpClient> AnthropicProvider<H> {
@@ -126,6 +164,7 @@ impl<H: HttpClient> AnthropicProvider<H> {
             credential,
             model: model.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
+            extra_headers: Vec::new(),
         }
     }
 
@@ -155,10 +194,44 @@ impl<H: HttpClient> AnthropicProvider<H> {
         Ok(Self::new(http, credential, model))
     }
 
+    /// Start a typed [`AnthropicBuilder`] over the injected transport for the
+    /// given Model.
+    ///
+    /// The builder layers the advanced knobs — an explicit Credential, a
+    /// base-URL override, and extra headers — over the same Credential
+    /// resolution [`resolve`](Self::resolve) uses.
+    #[must_use]
+    pub fn builder(http: H, model: impl Into<String>) -> AnthropicBuilder<H> {
+        AnthropicBuilder::new(http, model)
+    }
+
     /// Override the base URL (for proxies, gateways, or a test server).
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Append an extra header sent with every request, after the Provider's own
+    /// auth and version headers.
+    #[must_use]
+    pub fn with_header(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Append extra headers sent with every request, after the Provider's own
+    /// auth and version headers.
+    #[must_use]
+    pub fn with_headers(
+        mut self,
+        headers: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.extra_headers.extend(headers);
         self
     }
 
@@ -195,7 +268,99 @@ impl<H: HttpClient> AnthropicProvider<H> {
                 )
                 .header("anthropic-beta", ANTHROPIC_OAUTH_BETA),
         };
+        // Caller headers ride last, so a proxy or gateway can key off them.
+        let request = self
+            .extra_headers
+            .iter()
+            .fold(request, |req, (name, value)| req.header(name, value));
         Ok(request.body(body))
+    }
+}
+
+/// A typed builder for an [`AnthropicProvider`] with advanced configuration.
+///
+/// It gathers an injected transport, the Model, and the optional knobs — an
+/// explicit Credential, a base-URL override, and extra headers — then
+/// [`build`](Self::build)s a Provider, resolving the Credential through the same
+/// precedence [`AnthropicProvider::resolve`] uses (explicit, then the
+/// `ANTHROPIC_API_KEY` environment variable).
+#[derive(Clone)]
+pub struct AnthropicBuilder<H> {
+    http: H,
+    model: String,
+    credential: Option<Credential>,
+    base_url: Option<String>,
+    headers: Vec<(String, String)>,
+}
+
+impl<H: fmt::Debug> fmt::Debug for AnthropicBuilder<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnthropicBuilder")
+            .field("http", &self.http)
+            .field("model", &self.model)
+            .field("credential", &self.credential)
+            .field("base_url", &self.base_url)
+            .field("headers", &redacted_headers(&self.headers))
+            .finish()
+    }
+}
+
+impl<H: HttpClient> AnthropicBuilder<H> {
+    /// Start a builder over the injected transport for the given Model.
+    #[must_use]
+    pub fn new(http: H, model: impl Into<String>) -> Self {
+        Self {
+            http,
+            model: model.into(),
+            credential: None,
+            base_url: None,
+            headers: Vec::new(),
+        }
+    }
+
+    /// Authenticate with an explicit Credential, the top tier of resolution.
+    #[must_use]
+    pub fn credential(mut self, credential: Credential) -> Self {
+        self.credential = Some(credential);
+        self
+    }
+
+    /// Override the base URL (for proxies, gateways, or a test server).
+    #[must_use]
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Append an extra header sent with every request.
+    #[must_use]
+    pub fn header(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Resolve the Credential and build the Provider.
+    ///
+    /// Credential precedence follows [`resolve`](crate::token_store::resolve):
+    /// the explicit [`credential`](Self::credential) if set, else the
+    /// `ANTHROPIC_API_KEY` environment variable. An empty result is an
+    /// [`Authentication`](crate::ErrorKind::Authentication) error.
+    pub fn build(self) -> Result<AnthropicProvider<H>, Error> {
+        let mut provider = AnthropicProvider::resolve(
+            self.http,
+            self.model,
+            self.credential,
+            None,
+        )?;
+        if let Some(base_url) = self.base_url {
+            provider = provider.with_base_url(base_url);
+        }
+        provider = provider.with_headers(self.headers);
+        Ok(provider)
     }
 }
 
@@ -992,6 +1157,58 @@ mod tests {
         assert_eq!(body["system"], "Be terse.");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Hi");
+    }
+
+    #[tokio::test]
+    async fn builder_overrides_base_url_and_appends_extra_headers() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::builder(mock.clone(), "claude-3-5")
+            .credential(Credential::api_key("sk-secret"))
+            .base_url("https://gateway.internal/anthropic")
+            .header("x-tenant", "acme")
+            .build()
+            .unwrap();
+
+        provider
+            .complete(CompletionRequest::new(vec![Message::user("hi")]))
+            .await
+            .unwrap();
+
+        let sent = mock.last_request();
+        // The override replaces the default host, keeping the API path.
+        assert_eq!(sent.url, "https://gateway.internal/anthropic/v1/messages");
+        // The caller header rides alongside the Provider's own auth header.
+        assert!(
+            sent.headers
+                .iter()
+                .any(|(k, v)| k == "x-tenant" && v == "acme")
+        );
+        assert!(
+            sent.headers
+                .iter()
+                .any(|(k, v)| k == "x-api-key" && v == "sk-secret")
+        );
+    }
+
+    #[test]
+    fn debug_redacts_extra_header_values() {
+        let provider = AnthropicProvider::new(
+            std::sync::Arc::new(MockHttpClient::new()),
+            Credential::api_key("sk-secret"),
+            "claude-3-5",
+        )
+        .with_header("x-proxy-authorization", "super-secret-token");
+
+        let rendered = format!("{provider:?}");
+        // A header value may be a secret; the name stays visible, value gone.
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(rendered.contains("x-proxy-authorization"));
+        assert!(rendered.contains("redacted"));
+        // The Credential secret is still redacted through the manual Debug.
+        assert!(!rendered.contains("sk-secret"));
     }
 
     #[tokio::test]

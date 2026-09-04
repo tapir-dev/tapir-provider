@@ -7,4 +7,4 @@
 pub mod anthropic;
 
 #[cfg(feature = "anthropic")]
-pub use anthropic::AnthropicProvider;
+pub use anthropic::{AnthropicBuilder, AnthropicProvider};
