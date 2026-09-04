@@ -34,3 +34,9 @@ _Avoid_: Keyring, vault, cache.
 The compiled-in catalog of available Providers. Only entries whose feature is enabled
 are present, so the default build ships none.
 _Avoid_: Factory, plugin list.
+
+**Tool Call**:
+A request from the model to invoke a named tool with JSON arguments. It carries two
+ids: an SDK-minted id that is always present, so callers have a stable handle, and an
+optional provider-native id kept when the wire protocol supplies one.
+_Avoid_: Function call, invocation.

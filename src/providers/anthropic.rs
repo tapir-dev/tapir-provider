@@ -8,8 +8,10 @@ use crate::error::{Error, ErrorKind};
 use crate::http::{ByteStream, HttpClient, HttpRequest, Method};
 use crate::message::Role;
 use crate::provider::Provider;
-use crate::request::CompletionRequest;
-use crate::response::{CompletionResponse, FinishReason, Usage};
+use crate::request::{CompletionRequest, ToolChoice, ToolDefinition};
+use crate::response::{
+    CompletionResponse, FinishReason, ToolCall, Usage, mint_call_id,
+};
 use crate::sse::{SseDecoder, SseEvent};
 use crate::stream::{StreamEvent, StreamEvents};
 use async_trait::async_trait;
@@ -353,6 +355,10 @@ struct WireRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<WireTool<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
 }
@@ -391,14 +397,48 @@ impl<'a> WireRequest<'a> {
             Some(system_parts.join("\n\n"))
         };
 
+        let tools = request.tools.iter().map(WireTool::from).collect();
+
         Self {
             model,
             max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             messages,
             temperature: request.temperature,
             system,
+            tools,
+            tool_choice: request.tool_choice.as_ref().map(wire_tool_choice),
             stream: streaming.enabled(),
         }
+    }
+}
+
+/// A tool definition as sent in the Anthropic request body.
+#[derive(Debug, Serialize)]
+struct WireTool<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: &'a serde_json::Value,
+}
+
+impl<'a> From<&'a ToolDefinition> for WireTool<'a> {
+    fn from(tool: &'a ToolDefinition) -> Self {
+        Self {
+            name: &tool.name,
+            description: &tool.description,
+            input_schema: &tool.input_schema,
+        }
+    }
+}
+
+/// Map a neutral [`ToolChoice`] to Anthropic's `tool_choice` object.
+fn wire_tool_choice(choice: &ToolChoice) -> serde_json::Value {
+    match choice {
+        ToolChoice::Auto => serde_json::json!({"type": "auto"}),
+        ToolChoice::Any => serde_json::json!({"type": "any"}),
+        ToolChoice::Tool(name) => {
+            serde_json::json!({"type": "tool", "name": name})
+        }
+        ToolChoice::None => serde_json::json!({"type": "none"}),
     }
 }
 
@@ -429,8 +469,21 @@ impl WireResponse {
             .collect::<Vec<_>>()
             .concat();
 
+        let tool_calls = self
+            .content
+            .into_iter()
+            .filter(|block| block.block_type == "tool_use")
+            .map(|block| ToolCall {
+                id: mint_call_id(),
+                native_id: block.id,
+                name: block.name,
+                arguments: block.input,
+            })
+            .collect();
+
         CompletionResponse {
             text,
+            tool_calls,
             usage: Usage {
                 input_tokens: self.usage.input_tokens,
                 output_tokens: self.usage.output_tokens,
@@ -448,6 +501,15 @@ struct WireContentBlock {
     block_type: String,
     #[serde(default)]
     text: String,
+    /// The native tool-call id, present on `tool_use` blocks.
+    #[serde(default)]
+    id: Option<String>,
+    /// The tool name, present on `tool_use` blocks.
+    #[serde(default)]
+    name: String,
+    /// The tool arguments, present on `tool_use` blocks.
+    #[serde(default)]
+    input: serde_json::Value,
 }
 
 /// Token usage in the Anthropic response.
@@ -585,6 +647,104 @@ mod tests {
         assert_eq!(body["system"], "Be terse.");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Hi");
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_and_choice_map_onto_the_wire_body() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        });
+        let request = CompletionRequest::new(vec![Message::user("weather?")])
+            .with_tools(vec![ToolDefinition::new(
+                "get_weather",
+                "Look up the weather for a city",
+                schema.clone(),
+            )])
+            .with_tool_choice(ToolChoice::Tool("get_weather".to_owned()));
+        provider.complete(request).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert_eq!(
+            body["tools"][0]["description"],
+            "Look up the weather for a city"
+        );
+        assert_eq!(body["tools"][0]["input_schema"], schema);
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "get_weather");
+    }
+
+    #[tokio::test]
+    async fn omits_tools_and_choice_when_unset() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+        provider
+            .complete(CompletionRequest::new(vec![Message::user("hi")]))
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_use_response_normalizes_with_both_ids() {
+        let response = r#"{
+            "id": "msg_tool",
+            "content": [
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "toolu_42", "name": "get_weather", "input": {"city": "Paris"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 9, "output_tokens": 4}
+        }"#;
+        let mock =
+            std::sync::Arc::new(MockHttpClient::with_response(200, response));
+        let provider = AnthropicProvider::new(
+            mock,
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let completion = provider
+            .complete(CompletionRequest::new(vec![Message::user("weather?")]))
+            .await
+            .unwrap();
+
+        assert_eq!(completion.text, "Let me check.");
+        assert_eq!(completion.finish_reason, FinishReason::ToolUse);
+        assert_eq!(completion.tool_calls.len(), 1);
+        let call = &completion.tool_calls[0];
+        assert_eq!(call.native_id.as_deref(), Some("toolu_42"));
+        assert!(!call.id.is_empty());
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments, serde_json::json!({"city": "Paris"}));
     }
 
     #[tokio::test]
@@ -809,5 +969,43 @@ mod tests {
             }
         );
         assert_eq!(events[2], StreamEvent::ToolCallEnd { index: 0 });
+    }
+
+    #[tokio::test]
+    async fn folded_tool_stream_yields_a_complete_tool_call() {
+        // Arguments arrive split across two input_json_delta fragments.
+        let stream = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"get_weather\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"Paris\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":6}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mock = std::sync::Arc::new(MockHttpClient::with_stream(vec![
+            stream.as_bytes().to_vec(),
+        ]));
+        let provider = AnthropicProvider::new(
+            mock,
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let events = collect_stream(&provider).await;
+        let folded = StreamAccumulator::fold(&events);
+
+        assert_eq!(folded.finish_reason, FinishReason::ToolUse);
+        assert_eq!(folded.tool_calls.len(), 1);
+        let call = &folded.tool_calls[0];
+        assert_eq!(call.native_id.as_deref(), Some("toolu_9"));
+        assert!(!call.id.is_empty());
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments, serde_json::json!({"city": "Paris"}));
     }
 }

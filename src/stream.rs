@@ -12,7 +12,9 @@
 //! completion the non-streaming path would produce.
 
 use crate::error::Error;
-use crate::response::{CompletionResponse, FinishReason, Usage};
+use crate::response::{
+    CompletionResponse, FinishReason, ToolCall, Usage, mint_call_id,
+};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 
@@ -85,17 +87,34 @@ pub enum StreamEvent {
     Unknown(serde_json::Value),
 }
 
+/// A tool call being reassembled from streamed fragments.
+///
+/// The start event fixes the name and native id; the argument JSON arrives as
+/// zero or more delta fragments that concatenate in arrival order.
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    /// The Provider's native id, if the start event carried a non-empty one.
+    native_id: Option<String>,
+    /// The tool name from the start event.
+    name: String,
+    /// The argument JSON, concatenated from delta fragments.
+    json: String,
+}
+
 /// Folds a stream of [`StreamEvent`]s into a normalized [`CompletionResponse`].
 ///
 /// The accumulator is Provider-neutral: it concatenates text deltas per content
 /// block (joining blocks in `index` order, matching the non-streaming path),
-/// tracks the running usage, and records the finish reason from the terminal
-/// [`StreamEvent::Done`]. Reasoning and tool-call events do not contribute to
-/// the completion text, mirroring the non-streaming response shape.
+/// reassembles tool-call fragments keyed by content index, tracks the running
+/// usage, and records the finish reason from the terminal [`StreamEvent::Done`].
+/// Reasoning events and tool-call arguments do not contribute to the completion
+/// text, mirroring the non-streaming response shape.
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
     /// Text accumulated per content-block index, kept ordered by index.
     text: BTreeMap<usize, String>,
+    /// Tool calls being reassembled, keyed and ordered by content-block index.
+    tool_calls: BTreeMap<usize, PartialToolCall>,
     /// The most recent usage seen, from a `Usage` or `Done` event.
     usage: Usage,
     /// The finish reason from the terminal `Done` event, if seen.
@@ -115,6 +134,21 @@ impl StreamAccumulator {
             StreamEvent::TextDelta { index, text } => {
                 self.text.entry(*index).or_default().push_str(text);
             }
+            StreamEvent::ToolCallStart { index, id, name } => {
+                let call = self.tool_calls.entry(*index).or_default();
+                call.native_id = (!id.is_empty()).then(|| id.clone());
+                call.name = name.clone();
+            }
+            StreamEvent::ToolCallDelta {
+                index,
+                partial_json,
+            } => {
+                self.tool_calls
+                    .entry(*index)
+                    .or_default()
+                    .json
+                    .push_str(partial_json);
+            }
             StreamEvent::Usage(usage) => self.usage = *usage,
             StreamEvent::Done {
                 finish_reason,
@@ -123,8 +157,8 @@ impl StreamAccumulator {
                 self.usage = *usage;
                 self.finish_reason = Some(finish_reason.clone());
             }
-            // MessageStart, reasoning, tool calls, and unknown payloads do not
-            // shape the normalized text completion.
+            // MessageStart, reasoning, ToolCallEnd, and unknown payloads carry
+            // nothing the folded completion needs beyond what is handled above.
             _ => {}
         }
     }
@@ -149,8 +183,19 @@ impl StreamAccumulator {
     #[must_use]
     pub fn finish(self) -> CompletionResponse {
         let text = self.text.into_values().collect::<Vec<_>>().concat();
+        let tool_calls = self
+            .tool_calls
+            .into_values()
+            .map(|call| ToolCall {
+                id: mint_call_id(),
+                native_id: call.native_id,
+                name: call.name,
+                arguments: parse_arguments(&call.json),
+            })
+            .collect();
         CompletionResponse {
             text,
+            tool_calls,
             usage: self.usage,
             finish_reason: self
                 .finish_reason
@@ -159,6 +204,15 @@ impl StreamAccumulator {
             raw: serde_json::Value::Null,
         }
     }
+}
+
+/// Parse reassembled tool-call arguments, defaulting an empty or unparsable
+/// fragment to an empty JSON object so a caller always gets a value.
+fn parse_arguments(json: &str) -> serde_json::Value {
+    if json.trim().is_empty() {
+        return serde_json::json!({});
+    }
+    serde_json::from_str(json).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 #[cfg(test)]
@@ -238,6 +292,101 @@ mod tests {
         let completion = StreamAccumulator::fold(&events);
         assert_eq!(completion.text, "");
         assert_eq!(completion.finish_reason, FinishReason::ToolUse);
+    }
+
+    #[test]
+    fn reassembles_partial_tool_call_fragments() {
+        // Arguments arrive split across several deltas and must concatenate.
+        let events = vec![
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "toolu_1".to_owned(),
+                name: "get_weather".to_owned(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                partial_json: "{\"city\":".to_owned(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                partial_json: "\"Paris\"}".to_owned(),
+            },
+            StreamEvent::ToolCallEnd { index: 0 },
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ];
+        let completion = StreamAccumulator::fold(&events);
+        assert_eq!(completion.tool_calls.len(), 1);
+        let call = &completion.tool_calls[0];
+        assert_eq!(call.native_id.as_deref(), Some("toolu_1"));
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments, serde_json::json!({"city": "Paris"}));
+        assert!(!call.id.is_empty());
+    }
+
+    #[test]
+    fn interleaved_tool_calls_reassemble_in_index_order() {
+        let events = vec![
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "toolu_b".to_owned(),
+                name: "b".to_owned(),
+            },
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "toolu_a".to_owned(),
+                name: "a".to_owned(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                partial_json: "{\"x\":1}".to_owned(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 1,
+                partial_json: "{\"y\":2}".to_owned(),
+            },
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ];
+        let completion = StreamAccumulator::fold(&events);
+        let names: Vec<_> = completion
+            .tool_calls
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
+        assert_eq!(
+            completion.tool_calls[0].arguments,
+            serde_json::json!({"x": 1})
+        );
+    }
+
+    #[test]
+    fn tool_call_without_native_id_still_gets_a_minted_id() {
+        // A Provider that omits the native id leaves it empty on the start event.
+        let events = vec![
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: String::new(),
+                name: "search".to_owned(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                partial_json: "{}".to_owned(),
+            },
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ];
+        let completion = StreamAccumulator::fold(&events);
+        let call = &completion.tool_calls[0];
+        assert_eq!(call.native_id, None);
+        assert!(!call.id.is_empty());
     }
 
     #[test]

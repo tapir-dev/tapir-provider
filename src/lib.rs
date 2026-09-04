@@ -60,8 +60,8 @@ pub use error::{Error, ErrorKind};
 pub use http::{ByteStream, HttpClient, HttpRequest, HttpResponse, Method};
 pub use message::{Message, Role};
 pub use provider::Provider;
-pub use request::CompletionRequest;
-pub use response::{CompletionResponse, FinishReason, Usage};
+pub use request::{CompletionRequest, ToolChoice, ToolDefinition};
+pub use response::{CompletionResponse, FinishReason, ToolCall, Usage};
 pub use sse::{SseDecoder, SseEvent};
 pub use stream::{StreamAccumulator, StreamEvent, StreamEvents};
 
