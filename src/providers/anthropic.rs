@@ -101,14 +101,10 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
             ));
         }
 
-        let raw: serde_json::Value = serde_json::from_slice(&response.body)
-            .map_err(|err| {
-                Error::new(ErrorKind::Decode, err.to_string()).with_source(err)
-            })?;
         let wire: WireResponse =
-            serde_json::from_value(raw.clone()).map_err(|err| {
-                Error::new(ErrorKind::Decode, err.to_string()).with_source(err)
-            })?;
+            serde_json::from_slice(&response.body).map_err(Error::decode)?;
+        let raw: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(Error::decode)?;
 
         Ok(wire.into_response(raw))
     }
