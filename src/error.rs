@@ -116,6 +116,11 @@ impl Error {
         self
     }
 
+    /// Construct a [`ErrorKind::Decode`] error from a deserialization failure.
+    pub fn decode(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::new(ErrorKind::Decode, source.to_string()).with_source(source)
+    }
+
     /// The error's classification.
     #[must_use]
     pub const fn kind(&self) -> ErrorKind {

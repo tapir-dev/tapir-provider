@@ -21,17 +21,6 @@ pub enum Method {
     Post,
 }
 
-impl Method {
-    /// The uppercase method token as used on the wire.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Get => "GET",
-            Self::Post => "POST",
-        }
-    }
-}
-
 /// A transport-agnostic HTTP request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
