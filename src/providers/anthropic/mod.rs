@@ -345,9 +345,9 @@ impl<H: HttpClient> AnthropicBuilder<H> {
 
     /// Resolve the Credential and build the Provider.
     ///
-    /// Credential precedence follows [`resolve`](crate::token_store::resolve):
-    /// the explicit [`credential`](Self::credential) if set, else the
-    /// `ANTHROPIC_API_KEY` environment variable. An empty result is an
+    /// Credential precedence follows [`resolve`]: the explicit
+    /// [`credential`](Self::credential) if set, else the `ANTHROPIC_API_KEY`
+    /// environment variable. An empty result is an
     /// [`Authentication`](crate::ErrorKind::Authentication) error.
     pub fn build(self) -> Result<AnthropicProvider<H>, Error> {
         let mut provider = AnthropicProvider::resolve(
