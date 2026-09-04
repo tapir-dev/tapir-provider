@@ -1,0 +1,11 @@
+[package]
+name = "tapir-provider"
+version = "0.1.0"
+edition = "2024"
+license = "ISC"
+description = "Library includes models for agentic workflow"
+
+[package.metadata.cargo-machete]
+ignored = ["fuzz"]
+
+[dependencies]

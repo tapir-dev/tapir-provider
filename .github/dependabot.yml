@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    # Look for `Cargo.toml` and `Cargo.lock` in the root directory
+    directory: "/"
+    # Check for updates every Monday
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # Bundle non-breaking bumps into one PR; majors stay individual.
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+  - package-ecosystem: "cargo"
+    # The fuzz crate is outside the workspace and has its own `Cargo.lock`,
+    # so it needs a separate entry to stay in sync with the root manifest.
+    directory: "/fuzz"
+    # Check for updates every Monday
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    # Check for updates every Monday
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # Action majors are usually mechanical, so group everything.
+    groups:
+      github-actions:
+        patterns:
+          - "*"

@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512"
+     viewBox="0 0 512 512">
+  <defs>
+    <!-- body silhouette reused as a clip so the saddle marking stays inside.
+         The front of this path is the drooping prehensile snout. -->
+    <path id="body" d="M 78 314
+             C 70 286, 82 250, 110 224
+             C 130 204, 150 178, 182 150
+             C 198 140, 218 142, 244 150
+             C 294 138, 362 138, 412 170
+             C 440 187, 458 216, 452 256
+             C 448 290, 436 310, 416 318
+             C 356 336, 280 340, 220 333
+             C 190 329, 162 324, 148 316
+             C 138 322, 126 324, 118 320
+             C 104 326, 88 330, 80 322
+             C 76 320, 76 317, 78 314 Z"/>
+    <clipPath id="bodyclip"><use href="#body"/></clipPath>
+  </defs>
+
+  <!-- transparent background — true logo, usable over any colour -->
+
+  <!-- legs (behind the body); far-side pair slightly darker -->
+  <g fill="#184d43">
+    <rect x="232" y="300" width="34" height="118" rx="16"/>   <!-- front far -->
+    <rect x="372" y="300" width="34" height="118" rx="16"/>   <!-- rear far -->
+  </g>
+  <g fill="#1f6b59">
+    <rect x="180" y="305" width="36" height="116" rx="17"/>   <!-- front near -->
+    <rect x="322" y="305" width="36" height="116" rx="17"/>   <!-- rear near -->
+  </g>
+  <!-- hooves -->
+  <g fill="#133f37">
+    <rect x="180" y="404" width="36" height="17" rx="8"/>
+    <rect x="322" y="404" width="36" height="17" rx="8"/>
+    <rect x="232" y="401" width="34" height="17" rx="8"/>
+    <rect x="372" y="401" width="34" height="17" rx="8"/>
+  </g>
+
+  <!-- body -->
+  <use href="#body" fill="#1f6b59"/>
+
+  <!-- Malayan-tapir saddle: light midsection over back + flank, clipped.
+       Top and right edges overshoot the body outline on purpose so the clip
+       trims them to the silhouette — fills the back and rear cleanly, no dark
+       sliver. Bottom (belly) and left (head/body divide) edges are unchanged. -->
+  <g clip-path="url(#bodyclip)">
+    <path d="M 250 150
+             C 318 116, 412 122, 470 162
+             C 490 214, 490 276, 470 318
+             C 452 328, 432 326, 416 322
+             C 330 344, 250 340, 236 330
+             C 244 270, 244 200, 250 150 Z"
+          fill="#bfe6d7"/>
+  </g>
+
+  <!-- ear -->
+  <path d="M 196 150
+           C 200 120, 224 112, 234 130
+           C 240 144, 232 160, 214 166
+           C 204 162, 198 157, 196 150 Z"
+        fill="#1f6b59"/>
+  <path d="M 206 146
+           C 209 132, 221 128, 226 137
+           C 229 145, 224 153, 214 156
+           C 210 153, 207 150, 206 146 Z"
+        fill="#6fd7bd"/>
+
+  <!-- snout: lighter front strip down the proboscis + nostril at the tip -->
+  <g clip-path="url(#bodyclip)">
+    <path d="M 78 314
+             C 70 286, 82 250, 110 224
+             C 118 252, 114 288, 102 316
+             C 94 324, 84 324, 78 314 Z"
+          fill="#2f8f78"/>
+  </g>
+  <ellipse cx="88" cy="306" rx="8" ry="6" fill="#133f37"/>
+
+  <!-- eye -->
+  <circle cx="172" cy="204" r="11" fill="#133f37"/>
+  <circle cx="175" cy="200" r="3.5" fill="#fbf8f1"/>
+</svg>
