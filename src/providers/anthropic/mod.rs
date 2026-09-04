@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: ISC
 // SPDX-FileCopyrightText: 2026 Murilo Ijanc' <murilo@ijanc.org>
 
-//! The Anthropic [`Provider`], authenticating with an `x-api-key` Credential.
+//! The Anthropic [`Provider`], authenticating with an `x-api-key` or an OAuth
+//! `Bearer` Credential.
 
 pub mod oauth;
 
@@ -34,6 +35,15 @@ const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; use this when the request leaves it unset.
 const DEFAULT_MAX_TOKENS: u32 = 1024;
+/// `anthropic-beta` header value the OAuth lane must send; the API rejects an
+/// OAuth request without it.
+const ANTHROPIC_OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+/// System block the OAuth lane prepends ahead of the caller's own prompt; the
+/// API rejects an OAuth request whose leading system block is anything else.
+const CLAUDE_CODE_IDENTITY: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+/// Longest tool name Anthropic accepts; the OAuth lane truncates to this.
+const MAX_TOOL_NAME_LEN: usize = 128;
 
 /// Whether a request opts into a streamed (SSE) response.
 ///
@@ -51,6 +61,31 @@ impl Streaming {
     /// Whether streaming is requested, as the wire `stream` flag.
     const fn enabled(self) -> bool {
         matches!(self, Self::On)
+    }
+}
+
+/// Which authentication lane a request is shaped for.
+///
+/// The Credential variant fixes far more than the auth header: the OAuth lane
+/// must prepend the Claude Code identity system block and normalize tool names,
+/// or the API rejects the request. Threading this into the wire-body builder
+/// keeps that fork in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthLane {
+    /// An `x-api-key` Credential; the body is sent as-is.
+    ApiKey,
+    /// A `Bearer` OAuth Credential; the body carries the identity block and
+    /// normalized tool names.
+    OAuth,
+}
+
+impl AuthLane {
+    /// The lane a Credential is served on.
+    const fn for_credential(credential: &Credential) -> Self {
+        match credential {
+            Credential::OAuth(_) => Self::OAuth,
+            Credential::ApiKey { .. } => Self::ApiKey,
+        }
     }
 }
 
@@ -131,27 +166,35 @@ impl<H: HttpClient> AnthropicProvider<H> {
         request: &CompletionRequest,
         streaming: Streaming,
     ) -> Result<HttpRequest, Error> {
-        let api_key = self.credential.as_api_key().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Authentication,
-                "Anthropic Provider requires an API-key Credential",
-            )
-        })?;
+        let lane = AuthLane::for_credential(&self.credential);
 
         let body = serde_json::to_vec(&WireRequest::from_request(
             &self.model,
             request,
             streaming,
+            lane,
         ))
         .map_err(Error::serialize)?;
 
         let url =
             format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        Ok(HttpRequest::new(Method::Post, url)
-            .header("x-api-key", api_key)
+        let request = HttpRequest::new(Method::Post, url)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .body(body))
+            .header("content-type", "application/json");
+        // OAuth authorizes with a Bearer token and must announce the beta;
+        // an API key stays on the `x-api-key` lane.
+        let request = match &self.credential {
+            Credential::ApiKey { key, .. } => {
+                request.header("x-api-key", key.as_str())
+            }
+            Credential::OAuth(tokens) => request
+                .header(
+                    "authorization",
+                    format!("Bearer {}", tokens.access_token),
+                )
+                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA),
+        };
+        Ok(request.body(body))
     }
 }
 
@@ -396,7 +439,7 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<WireSystem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,6 +458,7 @@ impl<'a> WireRequest<'a> {
         model: &'a str,
         request: &'a CompletionRequest,
         streaming: Streaming,
+        lane: AuthLane,
     ) -> Self {
         let mut messages = Vec::new();
         let mut system_parts = Vec::new();
@@ -441,13 +485,18 @@ impl<'a> WireRequest<'a> {
             }
         }
 
-        let system = if system_parts.is_empty() {
+        let caller_system = if system_parts.is_empty() {
             None
         } else {
             Some(system_parts.join("\n\n"))
         };
+        let system = wire_system(caller_system, lane);
 
-        let tools = request.tools.iter().map(WireTool::from).collect();
+        let tools = request
+            .tools
+            .iter()
+            .map(|tool| WireTool::from_tool(tool, lane))
+            .collect();
 
         Self {
             model,
@@ -462,18 +511,95 @@ impl<'a> WireRequest<'a> {
     }
 }
 
+/// A message's `system` prompt on the wire.
+///
+/// The API-key lane sends the caller's prompt as a plain string (or omits it);
+/// the OAuth lane sends an array of typed blocks so the Claude Code identity can
+/// lead it.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum WireSystem {
+    /// A single text prompt.
+    Text(String),
+    /// Typed system blocks, identity first.
+    Blocks(Vec<WireSystemBlock>),
+}
+
+/// One typed `system` block in the Anthropic request body.
+#[derive(Debug, Serialize)]
+struct WireSystemBlock {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: String,
+}
+
+impl WireSystemBlock {
+    /// A `text`-typed system block.
+    fn text(text: impl Into<String>) -> Self {
+        Self {
+            block_type: "text",
+            text: text.into(),
+        }
+    }
+}
+
+/// Shape the caller's system prompt for the chosen lane.
+///
+/// The OAuth lane always yields at least the identity block — the API rejects
+/// an OAuth request without it — so this returns `Some` even when the caller
+/// supplied no system prompt.
+fn wire_system(
+    caller_system: Option<String>,
+    lane: AuthLane,
+) -> Option<WireSystem> {
+    match lane {
+        AuthLane::ApiKey => caller_system.map(WireSystem::Text),
+        AuthLane::OAuth => {
+            let mut blocks = vec![WireSystemBlock::text(CLAUDE_CODE_IDENTITY)];
+            if let Some(caller) = caller_system {
+                blocks.push(WireSystemBlock::text(caller));
+            }
+            Some(WireSystem::Blocks(blocks))
+        }
+    }
+}
+
+/// Normalize a tool name to Anthropic's accepted shape (`[a-zA-Z0-9_-]`, at
+/// most [`MAX_TOOL_NAME_LEN`] characters), borrowing when it already conforms.
+///
+/// The OAuth lane runs every tool name through this; a name carrying a `.`, a
+/// space, or other punctuation would otherwise be rejected.
+fn normalize_tool_name(name: &str) -> Cow<'_, str> {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    if name.chars().count() <= MAX_TOOL_NAME_LEN && name.chars().all(allowed) {
+        return Cow::Borrowed(name);
+    }
+    let normalized: String = name
+        .chars()
+        .map(|c| if allowed(c) { c } else { '_' })
+        .take(MAX_TOOL_NAME_LEN)
+        .collect();
+    Cow::Owned(normalized)
+}
+
 /// A tool definition as sent in the Anthropic request body.
 #[derive(Debug, Serialize)]
 struct WireTool<'a> {
-    name: &'a str,
+    name: Cow<'a, str>,
     description: &'a str,
     input_schema: &'a serde_json::Value,
 }
 
-impl<'a> From<&'a ToolDefinition> for WireTool<'a> {
-    fn from(tool: &'a ToolDefinition) -> Self {
+impl<'a> WireTool<'a> {
+    /// Map a neutral [`ToolDefinition`] onto the wire, normalizing the tool
+    /// name on the OAuth lane and passing it through unchanged otherwise.
+    fn from_tool(tool: &'a ToolDefinition, lane: AuthLane) -> Self {
+        let name = match lane {
+            AuthLane::ApiKey => Cow::Borrowed(tool.name.as_str()),
+            AuthLane::OAuth => normalize_tool_name(&tool.name),
+        };
         Self {
-            name: &tool.name,
+            name,
             description: &tool.description,
             input_schema: &tool.input_schema,
         }
@@ -684,6 +810,7 @@ fn map_finish_reason(stop_reason: Option<String>) -> FinishReason {
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use super::*;
+    use crate::credential::OAuthTokens;
     use crate::http::MockHttpClient;
     use crate::message::{MediaType, Message};
     use crate::stream::StreamAccumulator;
@@ -912,6 +1039,161 @@ mod tests {
         .unwrap();
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+    }
+
+    /// Build an OAuth-authenticated Provider over the given mock.
+    fn oauth_provider(
+        mock: std::sync::Arc<MockHttpClient>,
+    ) -> AnthropicProvider<std::sync::Arc<MockHttpClient>> {
+        AnthropicProvider::new(
+            mock,
+            Credential::oauth(OAuthTokens::new(
+                "access-tok",
+                "refresh-tok",
+                Some(1),
+            )),
+            "claude-3-5-sonnet",
+        )
+    }
+
+    #[tokio::test]
+    async fn oauth_credential_authorizes_with_bearer_and_the_beta_header() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = oauth_provider(mock.clone());
+        provider
+            .complete(CompletionRequest::new(vec![Message::user("Hi")]))
+            .await
+            .unwrap();
+
+        let sent = mock.last_request();
+        // The Bearer lane replaces `x-api-key` entirely.
+        assert!(
+            sent.headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == "Bearer access-tok")
+        );
+        assert!(!sent.headers.iter().any(|(k, _)| k == "x-api-key"));
+        assert!(
+            sent.headers.iter().any(
+                |(k, v)| k == "anthropic-beta" && v == ANTHROPIC_OAUTH_BETA
+            )
+        );
+        // The pinned version header still rides along.
+        assert!(
+            sent.headers.iter().any(
+                |(k, v)| k == "anthropic-version" && v == ANTHROPIC_VERSION
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_prepends_the_identity_block_ahead_of_the_caller_system() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = oauth_provider(mock.clone());
+        let request = CompletionRequest::new(vec![
+            Message::system("Be terse."),
+            Message::user("Hi"),
+        ]);
+        provider.complete(request).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        // System is an array of blocks, identity leading, caller's own next.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(body["system"][1]["text"], "Be terse.");
+    }
+
+    #[tokio::test]
+    async fn oauth_sends_the_identity_block_even_without_a_caller_system() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = oauth_provider(mock.clone());
+        provider
+            .complete(CompletionRequest::new(vec![Message::user("Hi")]))
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["system"][0]["text"], CLAUDE_CODE_IDENTITY);
+        // No caller prompt, so the identity block stands alone.
+        assert!(body["system"][1].is_null());
+    }
+
+    #[tokio::test]
+    async fn oauth_normalizes_tool_names_on_the_wire() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = oauth_provider(mock.clone());
+        let schema = serde_json::json!({"type": "object"});
+        let request = CompletionRequest::new(vec![Message::user("weather?")])
+            .with_tools(vec![ToolDefinition::new(
+                "get.weather now!",
+                "Look up the weather",
+                schema,
+            )]);
+        provider.complete(request).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["tools"][0]["name"], "get_weather_now_");
+    }
+
+    #[tokio::test]
+    async fn api_key_lane_leaves_tool_names_untouched() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+        let schema = serde_json::json!({"type": "object"});
+        let request = CompletionRequest::new(vec![Message::user("weather?")])
+            .with_tools(vec![ToolDefinition::new("get.weather", "d", schema)]);
+        provider.complete(request).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        // The normalization is OAuth-only; the API-key lane passes the raw name.
+        assert_eq!(body["tools"][0]["name"], "get.weather");
+    }
+
+    #[test]
+    fn normalize_tool_name_borrows_a_conforming_name() {
+        assert!(matches!(
+            normalize_tool_name("get_weather-2"),
+            Cow::Borrowed("get_weather-2")
+        ));
+    }
+
+    #[test]
+    fn normalize_tool_name_replaces_and_truncates() {
+        assert_eq!(normalize_tool_name("a.b c/d"), "a_b_c_d");
+        // Over-long names are cut to the accepted maximum.
+        let long = "x".repeat(MAX_TOOL_NAME_LEN + 10);
+        assert_eq!(normalize_tool_name(&long).len(), MAX_TOOL_NAME_LEN);
     }
 
     #[tokio::test]
