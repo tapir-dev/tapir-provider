@@ -10,6 +10,16 @@
 
 use crate::error::Error;
 use async_trait::async_trait;
+use std::pin::Pin;
+
+/// A boxed stream of response-body byte chunks, as they arrive off the wire.
+///
+/// Each item is one chunk (arbitrarily framed by the transport) or a
+/// [`ErrorKind::Transport`](crate::error::ErrorKind::Transport) error if the
+/// connection failed mid-stream. Chunk boundaries carry no meaning; a consumer
+/// reassembles them (see [`SseDecoder`](crate::sse::SseDecoder)).
+pub type ByteStream =
+    Pin<Box<dyn futures_core::Stream<Item = Result<Vec<u8>, Error>> + Send>>;
 
 /// The HTTP method for an [`HttpRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +109,30 @@ impl HttpResponse {
 pub trait HttpClient: Send + Sync {
     /// Send a request and await the full response.
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, Error>;
+
+    /// Send a request and stream the response body as byte chunks.
+    ///
+    /// A non-2xx status is classified up front via [`Error::from_status`], so
+    /// the returned stream only ever carries body chunks of a successful
+    /// response. The default buffers the whole body through [`send`](Self::send)
+    /// and yields it as one chunk; a transport that can stream (see
+    /// [`ReqwestClient`]) overrides this to forward chunks as they arrive.
+    async fn send_stream(
+        &self,
+        request: HttpRequest,
+    ) -> Result<ByteStream, Error> {
+        let response = self.send(request).await?;
+        if !response.is_success() {
+            return Err(Error::from_status(
+                response.status,
+                response.body_string(),
+            ));
+        }
+        let chunk = response.body;
+        Ok(Box::pin(futures_util::stream::once(
+            async move { Ok(chunk) },
+        )))
+    }
 }
 
 /// Forward through a shared handle so an `Arc<H>` (or `Arc<dyn HttpClient>`) is
@@ -108,14 +142,23 @@ impl<T: HttpClient + ?Sized> HttpClient for std::sync::Arc<T> {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, Error> {
         (**self).send(request).await
     }
+
+    async fn send_stream(
+        &self,
+        request: HttpRequest,
+    ) -> Result<ByteStream, Error> {
+        (**self).send_stream(request).await
+    }
 }
 
 #[cfg(feature = "reqwest")]
 mod reqwest_client {
     use super::{
-        Error, HttpClient, HttpRequest, HttpResponse, Method, async_trait,
+        ByteStream, Error, HttpClient, HttpRequest, HttpResponse, Method,
+        async_trait,
     };
     use crate::error::ErrorKind;
+    use futures_util::StreamExt;
 
     /// The default [`HttpClient`], backed by [`reqwest`].
     #[derive(Debug, Clone, Default)]
@@ -141,12 +184,9 @@ mod reqwest_client {
         Error::new(ErrorKind::Transport, err.to_string()).with_source(err)
     }
 
-    #[async_trait]
-    impl HttpClient for ReqwestClient {
-        async fn send(
-            &self,
-            request: HttpRequest,
-        ) -> Result<HttpResponse, Error> {
+    impl ReqwestClient {
+        /// Translate a transport-agnostic [`HttpRequest`] into a reqwest builder.
+        fn builder(&self, request: HttpRequest) -> reqwest::RequestBuilder {
             let method = match request.method {
                 Method::Get => reqwest::Method::GET,
                 Method::Post => reqwest::Method::POST,
@@ -158,8 +198,21 @@ mod reqwest_client {
             if let Some(body) = request.body {
                 builder = builder.body(body);
             }
+            builder
+        }
+    }
 
-            let response = builder.send().await.map_err(transport_error)?;
+    #[async_trait]
+    impl HttpClient for ReqwestClient {
+        async fn send(
+            &self,
+            request: HttpRequest,
+        ) -> Result<HttpResponse, Error> {
+            let response = self
+                .builder(request)
+                .send()
+                .await
+                .map_err(transport_error)?;
             let status = response.status().as_u16();
             let headers = response
                 .headers()
@@ -180,6 +233,30 @@ mod reqwest_client {
                 body,
             })
         }
+
+        async fn send_stream(
+            &self,
+            request: HttpRequest,
+        ) -> Result<ByteStream, Error> {
+            let response = self
+                .builder(request)
+                .send()
+                .await
+                .map_err(transport_error)?;
+            let status = response.status().as_u16();
+            // Classify a non-2xx up front: the error body is small and the
+            // caller wants a typed error, not a stream of the error payload.
+            if !(200..300).contains(&status) {
+                let body =
+                    response.text().await.unwrap_or_else(|err| err.to_string());
+                return Err(Error::from_status(status, body));
+            }
+
+            let bytes = response.bytes_stream().map(|chunk| {
+                chunk.map(|b| b.to_vec()).map_err(transport_error)
+            });
+            Ok(Box::pin(bytes))
+        }
     }
 }
 
@@ -188,16 +265,22 @@ pub use reqwest_client::ReqwestClient;
 
 #[cfg(feature = "test-utils")]
 mod mock {
-    use super::{Error, HttpClient, HttpRequest, HttpResponse, async_trait};
+    use super::{
+        ByteStream, Error, HttpClient, HttpRequest, HttpResponse, async_trait,
+    };
     use std::sync::Mutex;
 
     /// An in-crate [`HttpClient`] test double.
     ///
     /// It records every request it is sent and replies with a queue of canned
-    /// outcomes, so a Provider can be driven end to end with no network.
+    /// outcomes, so a Provider can be driven end to end with no network. The
+    /// streaming path has its own queue of chunk lists, so a test can hand the
+    /// decoder bytes framed exactly as it wants — including a payload split
+    /// across chunk boundaries.
     #[derive(Debug, Default)]
     pub struct MockHttpClient {
         responses: Mutex<Vec<Result<HttpResponse, Error>>>,
+        streams: Mutex<Vec<Vec<Vec<u8>>>>,
         requests: Mutex<Vec<HttpRequest>>,
     }
 
@@ -228,6 +311,21 @@ mod mock {
         /// Queue a transport-level error to hand back on the next `send`.
         pub fn push_error(&self, error: Error) {
             self.responses.lock().unwrap().push(Err(error));
+        }
+
+        /// A mock that streams the given byte chunks on the next `send_stream`.
+        #[must_use]
+        pub fn with_stream(chunks: Vec<Vec<u8>>) -> Self {
+            let mock = Self::new();
+            mock.push_stream(chunks);
+            mock
+        }
+
+        /// Queue a list of body chunks to stream on the next `send_stream`, in
+        /// order. The framing is preserved exactly, so a caller can split a
+        /// payload mid-event to exercise chunk-boundary handling.
+        pub fn push_stream(&self, chunks: Vec<Vec<u8>>) {
+            self.streams.lock().unwrap().push(chunks);
         }
 
         /// The requests captured so far, in order.
@@ -262,6 +360,23 @@ mod mock {
                 );
             }
             responses.remove(0)
+        }
+
+        async fn send_stream(
+            &self,
+            request: HttpRequest,
+        ) -> Result<ByteStream, Error> {
+            self.requests.lock().unwrap().push(request);
+            let mut streams = self.streams.lock().unwrap();
+            if streams.is_empty() {
+                panic!(
+                    "MockHttpClient received a stream request with no queued stream"
+                );
+            }
+            let chunks = streams.remove(0);
+            Ok(Box::pin(futures_util::stream::iter(
+                chunks.into_iter().map(Ok),
+            )))
         }
     }
 }

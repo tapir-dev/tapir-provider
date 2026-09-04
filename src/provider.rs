@@ -3,9 +3,10 @@
 
 //! The object-safe [`Provider`] trait.
 
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 use crate::request::CompletionRequest;
 use crate::response::CompletionResponse;
+use crate::stream::StreamEvents;
 use async_trait::async_trait;
 
 /// A pluggable adapter to one LLM backend.
@@ -20,6 +21,25 @@ pub trait Provider: Send + Sync {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse, Error>;
+
+    /// Stream a completion as ordered, incremental
+    /// [`StreamEvent`](crate::stream::StreamEvent)s.
+    ///
+    /// Streaming is a Capability a Provider opts into: the default reports it as
+    /// unsupported, so a Provider that only completes need not implement it. A
+    /// caller who ignores the deltas can fold the stream through a
+    /// [`StreamAccumulator`](crate::stream::StreamAccumulator) to recover the
+    /// same completion [`complete`](Self::complete) would return.
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamEvents, Error> {
+        let _ = request;
+        Err(Error::new(
+            ErrorKind::Other,
+            "this Provider does not support streaming",
+        ))
+    }
 }
 
 #[cfg(test)]

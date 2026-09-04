@@ -9,7 +9,8 @@
 //! model, and failures surface as a typed [`Error`] with an [`ErrorKind`].
 //!
 //! This is the crate spine: today it ships the Anthropic Provider (behind the
-//! `anthropic` feature) doing a single, non-streaming completion.
+//! `anthropic` feature) doing both a single, non-streaming completion and a
+//! streamed one that yields incremental [`StreamEvent`]s.
 //!
 //! # Example
 //!
@@ -51,14 +52,18 @@ pub mod provider;
 pub mod providers;
 pub mod request;
 pub mod response;
+pub mod sse;
+pub mod stream;
 
 pub use credential::Credential;
 pub use error::{Error, ErrorKind};
-pub use http::{HttpClient, HttpRequest, HttpResponse, Method};
+pub use http::{ByteStream, HttpClient, HttpRequest, HttpResponse, Method};
 pub use message::{Message, Role};
 pub use provider::Provider;
 pub use request::CompletionRequest;
 pub use response::{CompletionResponse, FinishReason, Usage};
+pub use sse::{SseDecoder, SseEvent};
+pub use stream::{StreamAccumulator, StreamEvent, StreamEvents};
 
 #[cfg(feature = "anthropic")]
 pub use providers::AnthropicProvider;

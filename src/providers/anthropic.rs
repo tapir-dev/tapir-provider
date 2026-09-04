@@ -5,13 +5,18 @@
 
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
-use crate::http::{HttpClient, HttpRequest, Method};
+use crate::http::{ByteStream, HttpClient, HttpRequest, Method};
 use crate::message::Role;
 use crate::provider::Provider;
 use crate::request::CompletionRequest;
 use crate::response::{CompletionResponse, FinishReason, Usage};
+use crate::sse::{SseDecoder, SseEvent};
+use crate::stream::{StreamEvent, StreamEvents};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// Default base URL for the Anthropic API.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -19,6 +24,25 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; use this when the request leaves it unset.
 const DEFAULT_MAX_TOKENS: u32 = 1024;
+
+/// Whether a request opts into a streamed (SSE) response.
+///
+/// A named alternative to a bare `bool` at the call sites that build the wire
+/// request, so `Streaming::On` reads for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Streaming {
+    /// Request an incremental SSE response.
+    On,
+    /// Request a single buffered response.
+    Off,
+}
+
+impl Streaming {
+    /// Whether streaming is requested, as the wire `stream` flag.
+    const fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
 
 /// A Provider for Anthropic's Messages API.
 ///
@@ -59,6 +83,7 @@ impl<H: HttpClient> AnthropicProvider<H> {
     fn build_http_request(
         &self,
         request: &CompletionRequest,
+        streaming: Streaming,
     ) -> Result<HttpRequest, Error> {
         let api_key = self.credential.as_api_key().ok_or_else(|| {
             Error::new(
@@ -70,6 +95,7 @@ impl<H: HttpClient> AnthropicProvider<H> {
         let body = serde_json::to_vec(&WireRequest::from_request(
             &self.model,
             request,
+            streaming,
         ))
         .map_err(|err| {
             Error::new(ErrorKind::Other, err.to_string()).with_source(err)
@@ -91,7 +117,7 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse, Error> {
-        let http_request = self.build_http_request(&request)?;
+        let http_request = self.build_http_request(&request, Streaming::Off)?;
         let response = self.http.send(http_request).await?;
 
         if !response.is_success() {
@@ -108,6 +134,213 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
 
         Ok(wire.into_response(raw))
     }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamEvents, Error> {
+        let http_request = self.build_http_request(&request, Streaming::On)?;
+        let bytes = self.http.send_stream(http_request).await?;
+        Ok(Box::pin(SseEventStream::new(bytes)))
+    }
+}
+
+/// Adapts a byte stream into ordered [`StreamEvent`]s.
+///
+/// It owns the pipeline for one streamed completion: the [`SseDecoder`] that
+/// reassembles events off the byte chunks, the [`StreamNormalizer`] that maps
+/// each Anthropic SSE event into the neutral vocabulary, and a queue holding
+/// the events a single chunk expanded into but that have not been yielded yet.
+struct SseEventStream {
+    /// The response body, streamed as byte chunks.
+    bytes: ByteStream,
+    /// Reassembles SSE events straddling chunk boundaries.
+    decoder: SseDecoder,
+    /// Maps Anthropic SSE events to the neutral vocabulary.
+    normalizer: StreamNormalizer,
+    /// Events decoded but not yet yielded to the caller.
+    pending: VecDeque<StreamEvent>,
+    /// Whether the byte stream has ended (or errored).
+    finished: bool,
+}
+
+impl SseEventStream {
+    fn new(bytes: ByteStream) -> Self {
+        Self {
+            bytes,
+            decoder: SseDecoder::new(),
+            normalizer: StreamNormalizer::default(),
+            pending: VecDeque::new(),
+            finished: false,
+        }
+    }
+}
+
+impl futures_core::Stream for SseEventStream {
+    type Item = Result<StreamEvent, Error>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(event) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(event)));
+            }
+            if this.finished {
+                return Poll::Ready(None);
+            }
+
+            match this.bytes.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    for sse in this.decoder.push(&chunk) {
+                        this.pending.extend(this.normalizer.normalize(&sse));
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    this.finished = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None) => {
+                    this.finished = true;
+                    if let Some(sse) = this.decoder.finish() {
+                        this.pending.extend(this.normalizer.normalize(&sse));
+                    }
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Turns Anthropic's SSE events into the neutral [`StreamEvent`] vocabulary.
+///
+/// It threads the small amount of state the mapping needs: the running token
+/// usage (Anthropic reports input tokens up front and output tokens at the
+/// end), the finish reason from `message_delta`, and which content-block
+/// indices are tool calls, so a `content_block_stop` on one becomes a
+/// [`StreamEvent::ToolCallEnd`].
+#[derive(Debug, Default)]
+struct StreamNormalizer {
+    /// Input tokens, reported in `message_start`.
+    input_tokens: u32,
+    /// Output tokens, reported cumulatively in `message_delta`.
+    output_tokens: u32,
+    /// Finish reason, reported in `message_delta`.
+    finish_reason: Option<FinishReason>,
+    /// Content-block indices that opened as tool calls.
+    tool_indices: HashSet<usize>,
+}
+
+impl StreamNormalizer {
+    /// The token usage seen so far.
+    fn usage(&self) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+        }
+    }
+
+    /// Map one Anthropic SSE event to zero or more neutral events.
+    fn normalize(&mut self, sse: &SseEvent) -> Vec<StreamEvent> {
+        // A payload that will not parse is not fatal; surface it verbatim.
+        let json: serde_json::Value = match serde_json::from_str(&sse.data) {
+            Ok(json) => json,
+            Err(_) => {
+                return vec![StreamEvent::Unknown(serde_json::Value::String(
+                    sse.data.clone(),
+                ))];
+            }
+        };
+        let index = json["index"].as_u64().unwrap_or(0) as usize;
+
+        match sse.event.as_deref() {
+            Some("message_start") => {
+                self.input_tokens = json["message"]["usage"]["input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0) as u32;
+                vec![StreamEvent::MessageStart]
+            }
+            Some("content_block_start") => {
+                let block = &json["content_block"];
+                if block["type"] == "tool_use" {
+                    self.tool_indices.insert(index);
+                    vec![StreamEvent::ToolCallStart {
+                        index,
+                        id: block["id"].as_str().unwrap_or_default().to_owned(),
+                        name: block["name"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    }]
+                } else {
+                    // A text or reasoning block opens with no incremental content.
+                    vec![]
+                }
+            }
+            Some("content_block_delta") => {
+                let delta = &json["delta"];
+                match delta["type"].as_str() {
+                    Some("text_delta") => vec![StreamEvent::TextDelta {
+                        index,
+                        text: delta["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    }],
+                    Some("thinking_delta") => {
+                        vec![StreamEvent::ReasoningDelta {
+                            index,
+                            text: delta["thinking"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        }]
+                    }
+                    Some("input_json_delta") => {
+                        vec![StreamEvent::ToolCallDelta {
+                            index,
+                            partial_json: delta["partial_json"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        }]
+                    }
+                    // e.g. `signature_delta`: recognized event, unmodeled delta.
+                    _ => vec![StreamEvent::Unknown(json)],
+                }
+            }
+            Some("content_block_stop") => {
+                if self.tool_indices.contains(&index) {
+                    vec![StreamEvent::ToolCallEnd { index }]
+                } else {
+                    vec![]
+                }
+            }
+            Some("message_delta") => {
+                if let Some(reason) = json["delta"]["stop_reason"].as_str() {
+                    self.finish_reason =
+                        Some(map_finish_reason(Some(reason.to_owned())));
+                }
+                if let Some(output) = json["usage"]["output_tokens"].as_u64() {
+                    self.output_tokens = output as u32;
+                }
+                vec![StreamEvent::Usage(self.usage())]
+            }
+            Some("message_stop") => vec![StreamEvent::Done {
+                finish_reason: self
+                    .finish_reason
+                    .clone()
+                    .unwrap_or(FinishReason::Other(String::new())),
+                usage: self.usage(),
+            }],
+            // A heartbeat carries nothing.
+            Some("ping") => vec![],
+            // Any other event (including `error`) is surfaced, not swallowed.
+            _ => vec![StreamEvent::Unknown(json)],
+        }
+    }
 }
 
 /// The Anthropic request body as sent on the wire.
@@ -120,10 +353,21 @@ struct WireRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    stream: bool,
+}
+
+/// Serde predicate: omit a `false` flag from the request body.
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 impl<'a> WireRequest<'a> {
-    fn from_request(model: &'a str, request: &'a CompletionRequest) -> Self {
+    fn from_request(
+        model: &'a str,
+        request: &'a CompletionRequest,
+        streaming: Streaming,
+    ) -> Self {
         let mut messages = Vec::new();
         let mut system_parts = Vec::new();
 
@@ -153,6 +397,7 @@ impl<'a> WireRequest<'a> {
             messages,
             temperature: request.temperature,
             system,
+            stream: streaming.enabled(),
         }
     }
 }
@@ -230,6 +475,41 @@ mod tests {
     use super::*;
     use crate::http::MockHttpClient;
     use crate::message::Message;
+    use crate::stream::StreamAccumulator;
+    use futures_util::StreamExt;
+
+    /// A full Anthropic message stream: a text block, then usage and stop.
+    const SAMPLE_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: ping\n",
+        "data: {\"type\":\"ping\"}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\", world\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    async fn collect_stream(
+        provider: &AnthropicProvider<std::sync::Arc<MockHttpClient>>,
+    ) -> Vec<StreamEvent> {
+        let request = CompletionRequest::new(vec![Message::user("hi")]);
+        provider
+            .complete_stream(request)
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+            .await
+    }
 
     const SAMPLE_RESPONSE: &str = r#"{
         "id": "msg_123",
@@ -349,5 +629,185 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.kind(), kind, "status {status}");
         }
+    }
+
+    #[tokio::test]
+    async fn streams_ordered_events_ending_in_done() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_stream(vec![
+            SAMPLE_STREAM.as_bytes().to_vec(),
+        ]));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let events = collect_stream(&provider).await;
+
+        assert_eq!(events.first(), Some(&StreamEvent::MessageStart));
+        assert_eq!(
+            events[1],
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "Hello".to_owned()
+            }
+        );
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage {
+                    input_tokens: 7,
+                    output_tokens: 5
+                }
+            })
+        ));
+
+        // The request opted into streaming on the wire.
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn decodes_events_split_across_chunk_boundaries() {
+        // Split the raw stream mid-event, at an arbitrary byte offset.
+        let raw = SAMPLE_STREAM.as_bytes();
+        let mid = raw.len() / 2;
+        let chunks = vec![raw[..mid].to_vec(), raw[mid..].to_vec()];
+        let mock = std::sync::Arc::new(MockHttpClient::with_stream(chunks));
+        let provider = AnthropicProvider::new(
+            mock,
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let events = collect_stream(&provider).await;
+        // Same events despite the boundary falling inside an event.
+        assert_eq!(events.first(), Some(&StreamEvent::MessageStart));
+        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn accumulator_folds_stream_into_the_non_streaming_shape() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_stream(vec![
+            SAMPLE_STREAM.as_bytes().to_vec(),
+        ]));
+        let provider = AnthropicProvider::new(
+            mock,
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let events = collect_stream(&provider).await;
+        let folded = StreamAccumulator::fold(&events);
+
+        assert_eq!(folded.text, "Hello, world");
+        assert_eq!(folded.finish_reason, FinishReason::Stop);
+        assert_eq!(folded.usage.input_tokens, 7);
+        assert_eq!(folded.usage.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn unknown_sse_payloads_surface_as_unknown_events() {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            // An event type this Provider does not model.
+            "event: some_future_event\n",
+            "data: {\"type\":\"some_future_event\",\"payload\":42}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mock = std::sync::Arc::new(MockHttpClient::with_stream(vec![
+            stream.as_bytes().to_vec(),
+        ]));
+        let provider = AnthropicProvider::new(
+            mock,
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let events = collect_stream(&provider).await;
+        let unknown = events
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Unknown(_)))
+            .expect("unmodeled event should surface as Unknown");
+        if let StreamEvent::Unknown(value) = unknown {
+            assert_eq!(value["payload"], 42);
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_reasoning_deltas_from_thinking_blocks() {
+        let stream = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me think\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mock = std::sync::Arc::new(MockHttpClient::with_stream(vec![
+            stream.as_bytes().to_vec(),
+        ]));
+        let provider = AnthropicProvider::new(
+            mock,
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let events = collect_stream(&provider).await;
+        assert_eq!(
+            events[0],
+            StreamEvent::ReasoningDelta {
+                index: 0,
+                text: "let me think".to_owned(),
+            }
+        );
+        // Reasoning never contributes to the folded completion text.
+        assert_eq!(StreamAccumulator::fold(&events).text, "");
+    }
+
+    #[tokio::test]
+    async fn streams_a_tool_call_start_delta_and_end() {
+        let stream = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mock = std::sync::Arc::new(MockHttpClient::with_stream(vec![
+            stream.as_bytes().to_vec(),
+        ]));
+        let provider = AnthropicProvider::new(
+            mock,
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let events = collect_stream(&provider).await;
+        assert_eq!(
+            events[0],
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "toolu_1".to_owned(),
+                name: "get_weather".to_owned(),
+            }
+        );
+        assert_eq!(
+            events[1],
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                partial_json: "{\"city\":".to_owned(),
+            }
+        );
+        assert_eq!(events[2], StreamEvent::ToolCallEnd { index: 0 });
     }
 }

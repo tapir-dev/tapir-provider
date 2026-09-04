@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: ISC
+// SPDX-FileCopyrightText: 2026 Murilo Ijanc' <murilo@ijanc.org>
+
+//! The streaming vocabulary: incremental [`StreamEvent`]s and the
+//! [`StreamAccumulator`] that folds them back into a [`CompletionResponse`].
+//!
+//! A Provider that streams surfaces a completion as an ordered sequence of
+//! [`StreamEvent`]s. Each event is Provider-neutral and carries a content
+//! `index` so deltas can be correlated to the content block they belong to. A
+//! caller that only wants the final answer can ignore every delta and fold the
+//! whole stream through a [`StreamAccumulator`], arriving at the same normalized
+//! completion the non-streaming path would produce.
+
+use crate::error::Error;
+use crate::response::{CompletionResponse, FinishReason, Usage};
+use std::collections::BTreeMap;
+use std::pin::Pin;
+
+/// A boxed, ordered stream of [`StreamEvent`]s returned by a streaming Provider.
+///
+/// The trait object keeps the [`Provider`](crate::provider::Provider) trait
+/// object-safe: the concrete stream type is erased behind a box so heterogeneous
+/// Providers can be held together and supplied by third parties.
+pub type StreamEvents = Pin<
+    Box<dyn futures_core::Stream<Item = Result<StreamEvent, Error>> + Send>,
+>;
+
+/// One incremental event in a streamed completion.
+///
+/// Text, reasoning, and tool-call events carry an `index` identifying the
+/// content block they belong to, so out-of-band events (usage, done) and
+/// interleaved blocks stay correlated. Payloads a Provider does not model
+/// surface as [`StreamEvent::Unknown`] rather than failing the stream.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum StreamEvent {
+    /// The message has begun; no content has arrived yet.
+    MessageStart,
+    /// A run of generated text for the block at `index`.
+    TextDelta {
+        /// The content block this delta extends.
+        index: usize,
+        /// The text fragment.
+        text: String,
+    },
+    /// A run of model reasoning ("thinking") for the block at `index`.
+    ReasoningDelta {
+        /// The content block this delta extends.
+        index: usize,
+        /// The reasoning fragment.
+        text: String,
+    },
+    /// A tool call has begun at `index`, with its id and tool name.
+    ToolCallStart {
+        /// The content block this tool call occupies.
+        index: usize,
+        /// The Provider's id for this tool call.
+        id: String,
+        /// The name of the tool being invoked.
+        name: String,
+    },
+    /// A fragment of the JSON arguments for the tool call at `index`.
+    ToolCallDelta {
+        /// The content block this delta extends.
+        index: usize,
+        /// A fragment of the arguments JSON, to be concatenated in order.
+        partial_json: String,
+    },
+    /// The tool call at `index` is complete.
+    ToolCallEnd {
+        /// The content block that finished.
+        index: usize,
+    },
+    /// Updated token accounting for the message so far.
+    Usage(Usage),
+    /// The stream is finished, carrying the finish reason and final usage.
+    Done {
+        /// Why generation stopped.
+        finish_reason: FinishReason,
+        /// Final token accounting.
+        usage: Usage,
+    },
+    /// A payload the Provider recognized as an event but does not model, kept as
+    /// its raw JSON so nothing is silently dropped.
+    Unknown(serde_json::Value),
+}
+
+/// Folds a stream of [`StreamEvent`]s into a normalized [`CompletionResponse`].
+///
+/// The accumulator is Provider-neutral: it concatenates text deltas per content
+/// block (joining blocks in `index` order, matching the non-streaming path),
+/// tracks the running usage, and records the finish reason from the terminal
+/// [`StreamEvent::Done`]. Reasoning and tool-call events do not contribute to
+/// the completion text, mirroring the non-streaming response shape.
+#[derive(Debug, Default)]
+pub struct StreamAccumulator {
+    /// Text accumulated per content-block index, kept ordered by index.
+    text: BTreeMap<usize, String>,
+    /// The most recent usage seen, from a `Usage` or `Done` event.
+    usage: Usage,
+    /// The finish reason from the terminal `Done` event, if seen.
+    finish_reason: Option<FinishReason>,
+}
+
+impl StreamAccumulator {
+    /// A fresh accumulator with no events folded in.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one event into the running completion.
+    pub fn push(&mut self, event: &StreamEvent) {
+        match event {
+            StreamEvent::TextDelta { index, text } => {
+                self.text.entry(*index).or_default().push_str(text);
+            }
+            StreamEvent::Usage(usage) => self.usage = *usage,
+            StreamEvent::Done {
+                finish_reason,
+                usage,
+            } => {
+                self.usage = *usage;
+                self.finish_reason = Some(finish_reason.clone());
+            }
+            // MessageStart, reasoning, tool calls, and unknown payloads do not
+            // shape the normalized text completion.
+            _ => {}
+        }
+    }
+
+    /// Fold every event from an iterator, then finish.
+    pub fn fold<'a, I>(iter: I) -> CompletionResponse
+    where
+        I: IntoIterator<Item = &'a StreamEvent>,
+    {
+        let mut acc = Self::new();
+        for event in iter {
+            acc.push(event);
+        }
+        acc.finish()
+    }
+
+    /// Produce the completion the folded events describe.
+    ///
+    /// Absent a terminal `Done` event, the finish reason falls back to an empty
+    /// [`FinishReason::Other`], the same placeholder the non-streaming path uses
+    /// for a missing stop reason.
+    #[must_use]
+    pub fn finish(self) -> CompletionResponse {
+        let text = self.text.into_values().collect::<Vec<_>>().concat();
+        CompletionResponse {
+            text,
+            usage: self.usage,
+            finish_reason: self
+                .finish_reason
+                .unwrap_or(FinishReason::Other(String::new())),
+            // The stream has no single raw body; the escape hatch is empty.
+            raw: serde_json::Value::Null,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folds_ordered_text_deltas_into_one_completion() {
+        let events = vec![
+            StreamEvent::MessageStart,
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "Hello".to_owned(),
+            },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: ", world".to_owned(),
+            },
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage {
+                    input_tokens: 3,
+                    output_tokens: 4,
+                },
+            },
+        ];
+
+        let completion = StreamAccumulator::fold(&events);
+        assert_eq!(completion.text, "Hello, world");
+        assert_eq!(completion.usage.input_tokens, 3);
+        assert_eq!(completion.usage.output_tokens, 4);
+        assert_eq!(completion.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn concatenates_multiple_blocks_in_index_order() {
+        // Deltas arrive interleaved but must join in index order.
+        let events = vec![
+            StreamEvent::TextDelta {
+                index: 1,
+                text: " second".to_owned(),
+            },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "first".to_owned(),
+            },
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            },
+        ];
+        assert_eq!(StreamAccumulator::fold(&events).text, "first second");
+    }
+
+    #[test]
+    fn reasoning_and_tool_events_do_not_shape_the_text() {
+        let events = vec![
+            StreamEvent::ReasoningDelta {
+                index: 0,
+                text: "thinking...".to_owned(),
+            },
+            StreamEvent::ToolCallStart {
+                index: 1,
+                id: "call_1".to_owned(),
+                name: "get_weather".to_owned(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 1,
+                partial_json: "{\"city\":".to_owned(),
+            },
+            StreamEvent::ToolCallEnd { index: 1 },
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ];
+        let completion = StreamAccumulator::fold(&events);
+        assert_eq!(completion.text, "");
+        assert_eq!(completion.finish_reason, FinishReason::ToolUse);
+    }
+
+    #[test]
+    fn usage_event_updates_running_accounting() {
+        let events = vec![
+            StreamEvent::Usage(Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+            }),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 7,
+                },
+            },
+        ];
+        // Done carries the final, authoritative usage.
+        assert_eq!(StreamAccumulator::fold(&events).usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn missing_done_falls_back_to_an_empty_other_reason() {
+        let events = vec![StreamEvent::TextDelta {
+            index: 0,
+            text: "partial".to_owned(),
+        }];
+        let completion = StreamAccumulator::fold(&events);
+        assert_eq!(completion.text, "partial");
+        assert_eq!(
+            completion.finish_reason,
+            FinishReason::Other(String::new())
+        );
+    }
+}
