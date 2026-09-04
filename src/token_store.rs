@@ -167,8 +167,8 @@ mod file {
     ///
     /// The whole file is one table of `provider` → [`Credential`]; a read takes
     /// a shared lock and a write an exclusive one, so a fresh process loads the
-    /// Credentials an earlier run stored. On Unix the file is created `0600`
-    /// since it holds secrets.
+    /// Credentials an earlier run stored. On Unix the file is created `0600`,
+    /// owner-only, since Credentials are sensitive.
     ///
     /// Beyond plain [`get`](TokenStore::get)/[`set`](TokenStore::set), it owns
     /// [`refresh_if_stale`](Self::refresh_if_stale): a locked, double-checked
@@ -712,8 +712,11 @@ mod refresh_coordination_tests {
         let on_disk = store.get("anthropic").unwrap().unwrap();
         assert_eq!(on_disk.as_oauth().unwrap().access_token, "new-access");
 
-        // A second caller re-checks under the lock, sees the fresh token, and
-        // skips the redundant refresh — no further request hits the transport.
+        // A later caller sees the fresh token on its first (shared-lock) read
+        // and returns it without refreshing — no further request hits the
+        // transport. (The under-lock re-check, which only fires when the token
+        // still looks stale at the shared read, is covered by the concurrent
+        // `racing_callers_*` test below.)
         let again = store
             .refresh_if_stale_at("anthropic", &flow, 300, now)
             .await
@@ -783,5 +786,98 @@ mod refresh_coordination_tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    /// A refresher that mints one fresh token, holding the exclusive lock across
+    /// a deliberate stall so the second racing caller is forced to wait for the
+    /// lock and re-read under it. It counts its calls so the test can assert the
+    /// refresh is not duplicated.
+    struct SlowRefresher {
+        calls: std::sync::atomic::AtomicUsize,
+        fresh_expiry: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl Refresh for SlowRefresher {
+        async fn refresh(
+            &self,
+            _refresh_token: &str,
+        ) -> Result<Credential, Error> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Hold the exclusive lock long enough that the loser is parked
+            // waiting on it before this write lands.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(Credential::oauth(OAuthTokens::new(
+                "new-access",
+                "new-refresh",
+                Some(self.fresh_expiry),
+            )))
+        }
+    }
+
+    // Two callers race on the same stale token. The file lock serializes them:
+    // the winner refreshes once; the loser, blocked on the lock, re-reads the
+    // now-fresh token under it and skips the redundant refresh. Exercises the
+    // double-checked under-lock path and lock contention that the sequential
+    // tests cannot reach.
+    #[test]
+    fn racing_callers_refresh_once_via_the_under_lock_recheck() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let temp = TempStore::new("race");
+        let store = temp.store();
+        let now = now_secs();
+        // Stored token expires now: stale within any positive window.
+        store
+            .set(
+                "anthropic",
+                Credential::oauth(OAuthTokens::new(
+                    "old",
+                    "old-ref",
+                    Some(now),
+                )),
+            )
+            .unwrap();
+
+        let refresher = Arc::new(SlowRefresher {
+            calls: AtomicUsize::new(0),
+            fresh_expiry: now + 100_000,
+        });
+        // Release both threads together so both complete their shared-lock read
+        // (seeing the stale token) before either takes the exclusive lock.
+        let gate = Arc::new(Barrier::new(2));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let refresher = Arc::clone(&refresher);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    gate.wait();
+                    rt.block_on(store.refresh_if_stale(
+                        "anthropic",
+                        &*refresher,
+                        300,
+                    ))
+                    .unwrap()
+                })
+            })
+            .collect();
+
+        let results: Vec<_> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Exactly one refresh happened despite two racing callers.
+        assert_eq!(refresher.calls.load(Ordering::SeqCst), 1);
+        // Both callers end up holding the renewed token.
+        for cred in &results {
+            let tokens = cred.as_ref().unwrap().as_oauth().unwrap();
+            assert_eq!(tokens.access_token, "new-access");
+        }
     }
 }
