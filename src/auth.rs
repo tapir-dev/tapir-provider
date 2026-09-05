@@ -10,6 +10,7 @@
 //! API key and base URL when there is one, and the [`AuthSource`] tier that won
 //! the precedence. It is computed on demand and never persisted.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Which tier a [`ResolvedAuth`] came from.
@@ -46,10 +47,11 @@ impl fmt::Display for AuthSource {
 /// The request-ready material a Provider would send this turn.
 ///
 /// One auth inspection produces this: the auth `headers`, an auth-derived
-/// `api_key` and `base_url` when there is one, and the [`AuthSource`] that won.
-/// A provider-scoped inspection carries only the auth headers; a Model-scoped
-/// one also layers that Model's headers and base URL. `#[non_exhaustive]`
-/// because further resolved fields may join it.
+/// `api_key` and `base_url` when there is one, the winning Credential's Provider
+/// `config`, and the [`AuthSource`] that won. A provider-scoped inspection
+/// carries only the auth headers; a Model-scoped one also layers that Model's
+/// headers and base URL. `#[non_exhaustive]` because further resolved fields may
+/// join it.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ResolvedAuth {
@@ -63,11 +65,17 @@ pub struct ResolvedAuth {
     /// The base URL a Model-scoped inspection resolved; `None` when
     /// provider-scoped.
     pub base_url: Option<String>,
+    /// The winning Credential's Provider Config, non-secret. Populated only when
+    /// a stored API-key Credential wins; empty for the per-request key,
+    /// environment-variable, and OAuth tiers. Present regardless of scope, since
+    /// it comes from the Credential, not the Model.
+    pub config: BTreeMap<String, String>,
 }
 
 /// Redacts header *values* and the `api_key` so a secret never reaches Debug
 /// output — matching the crate's [`Credential`](crate::Credential) discipline.
-/// Header names, the source, and the base URL stay visible.
+/// Header names, the source, the base URL, and the non-secret Provider config
+/// stay visible.
 impl fmt::Debug for ResolvedAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let headers: Vec<(&str, &str)> = self
@@ -80,6 +88,7 @@ impl fmt::Debug for ResolvedAuth {
             .field("headers", &headers)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("base_url", &self.base_url)
+            .field("config", &self.config)
             .finish()
     }
 }
@@ -109,6 +118,10 @@ mod tests {
             )],
             api_key: Some("sk-super-secret".to_owned()),
             base_url: Some("https://api.example.com".to_owned()),
+            config: BTreeMap::from([(
+                "CLOUDFLARE_ACCOUNT_ID".to_owned(),
+                "acct-123".to_owned(),
+            )]),
         };
         let rendered = format!("{auth:?}");
         assert!(!rendered.contains("sk-super-secret"));
@@ -117,5 +130,8 @@ mod tests {
         assert!(rendered.contains("x-api-key"));
         assert!(rendered.contains("Stored"));
         assert!(rendered.contains("https://api.example.com"));
+        // The Provider Config is non-secret and renders like the base URL.
+        assert!(rendered.contains("CLOUDFLARE_ACCOUNT_ID"));
+        assert!(rendered.contains("acct-123"));
     }
 }

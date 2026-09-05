@@ -59,9 +59,12 @@ _Avoid_: Keyring, vault, cache.
 **Resolved Auth**:
 What one auth inspection produces: the request-ready material a Provider would send
 this turn — its auth headers, an auth-derived API key and base URL when there is one,
-and the Auth Source that won. Unlike a Credential (stored material), it is computed on
-demand and never persisted. A provider-scoped inspection carries only the auth headers;
-a Model-scoped one also layers that Model's headers and base URL.
+the winning Credential's Provider Config, and the Auth Source that won. Unlike a
+Credential (stored material), it is computed on demand and never persisted. A
+provider-scoped inspection carries only the auth headers; a Model-scoped one also layers
+that Model's headers and base URL. The Provider Config rides along in either scope,
+since it comes from the Credential not the Model, and is present only when a stored
+API-key Credential wins.
 _Avoid_: Auth, resolved credential, auth result.
 
 **Auth Source**:

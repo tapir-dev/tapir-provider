@@ -30,10 +30,11 @@ mod user_config;
 #[cfg(feature = "models-user-config")]
 pub use user_config::default_path as user_config_path;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::auth::ResolvedAuth;
+use crate::auth::{AuthSource, ResolvedAuth};
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
 use crate::http::HttpClient;
@@ -130,7 +131,7 @@ impl ModelRegistry {
     ///
     /// Resolves the Provider's Credential by the usual precedence — the retained
     /// Token Store under the Provider's id, then its API-key environment
-    /// variable — and reports the [`ResolvedAuth`]: the [`AuthSource`](crate::AuthSource)
+    /// variable — and reports the [`ResolvedAuth`]: the [`AuthSource`]
     /// tier that won, the auth headers a request would carry, and an
     /// auth-derived API key. A stale stored OAuth token is refreshed over
     /// `transport` first and the renewal persisted through the Store.
@@ -199,6 +200,14 @@ impl ModelRegistry {
             provider_auth_headers(id, &credential).unwrap_or_default();
         let api_key = credential.as_api_key().map(str::to_owned);
         let base_url = model.map(|entry| entry.model.base_url.clone());
+        // Only a stored API-key Credential carries Provider Config; the
+        // per-request, environment, and OAuth tiers resolve without one.
+        let config = match source {
+            AuthSource::Stored => {
+                credential.config().cloned().unwrap_or_default()
+            }
+            _ => BTreeMap::new(),
+        };
         if let Some(entry) = model {
             headers.extend(entry.model.headers.iter().cloned());
         }
@@ -208,6 +217,7 @@ impl ModelRegistry {
             headers,
             api_key,
             base_url,
+            config,
         }))
     }
 
@@ -990,6 +1000,58 @@ mod auth_tests {
     }
 
     #[tokio::test]
+    async fn get_auth_carries_the_stored_credentials_provider_config() {
+        let store = Arc::new(InMemoryTokenStore::new());
+        store
+            .set(
+                "openai",
+                Credential::api_key("sk-openai").with_config([(
+                    "CLOUDFLARE_ACCOUNT_ID".to_owned(),
+                    "acct-123".to_owned(),
+                )]),
+            )
+            .unwrap();
+        let registry = ModelRegistry::load(Some(store.clone()), None).unwrap();
+        let http = MockHttpClient::new();
+
+        let auth = registry.get_auth("openai", &http).await.unwrap().unwrap();
+        assert_eq!(auth.source, AuthSource::Stored);
+        assert_eq!(auth.config["CLOUDFLARE_ACCOUNT_ID"], "acct-123");
+    }
+
+    #[tokio::test]
+    async fn get_auth_for_carries_config_on_a_model_scoped_inspection() {
+        let store = Arc::new(InMemoryTokenStore::new());
+        store
+            .set(
+                "openai",
+                Credential::api_key("sk-openai")
+                    .with_config([("GATEWAY".to_owned(), "gw-1".to_owned())]),
+            )
+            .unwrap();
+        let registry = ModelRegistry::load(Some(store.clone()), None).unwrap();
+        let entry = registry.find("openai", "gpt-4o-mini").unwrap().clone();
+        let http = MockHttpClient::new();
+
+        let auth = registry.get_auth_for(&entry, &http).await.unwrap().unwrap();
+        // Config comes from the Credential, so it survives the Model layering.
+        assert_eq!(auth.config["GATEWAY"], "gw-1");
+    }
+
+    #[tokio::test]
+    async fn get_auth_config_is_empty_for_a_bare_stored_key() {
+        let store = Arc::new(InMemoryTokenStore::new());
+        store
+            .set("openai", Credential::api_key("sk-openai"))
+            .unwrap();
+        let registry = ModelRegistry::load(Some(store.clone()), None).unwrap();
+        let http = MockHttpClient::new();
+
+        let auth = registry.get_auth("openai", &http).await.unwrap().unwrap();
+        assert!(auth.config.is_empty());
+    }
+
+    #[tokio::test]
     async fn get_auth_on_an_unknown_provider_is_none() {
         let registry = ModelRegistry::load(None, None).unwrap();
         let http = MockHttpClient::new();
@@ -1047,6 +1109,8 @@ mod oauth_refresh_tests {
             .unwrap()
             .unwrap();
         assert_eq!(auth.source, AuthSource::OAuth);
+        // The OAuth tier carries no Provider Config.
+        assert!(auth.config.is_empty());
         // The refreshed Bearer reached the reported headers...
         assert!(
             auth.headers

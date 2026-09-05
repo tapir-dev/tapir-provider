@@ -79,6 +79,11 @@ required-features = ["models"]
 name = "auth"
 required-features = ["models", "openai"]
 
+# Provider Config reaching Resolved Auth; needs the Model Registry and a Provider.
+[[example]]
+name = "credential_store"
+required-features = ["models", "openai"]
+
 # Live Model-list refresh example; needs the fetch layer and both Providers.
 [[example]]
 name = "dynamic_providers"
