@@ -12,10 +12,13 @@
 //! [`AssistantMessage`] the non-streaming path would produce.
 
 use crate::error::Error;
+use crate::http::ByteStream;
 use crate::message::{AssistantMessage, ContentPart};
 use crate::response::{FinishReason, Usage, mint_call_id};
-use std::collections::BTreeMap;
+use crate::sse::{SseDecoder, SseEvent};
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
+use std::task::Poll;
 
 /// A boxed, ordered stream of [`StreamEvent`]s returned by a streaming Provider.
 ///
@@ -107,6 +110,95 @@ pub enum StreamEvent {
     /// A payload the Provider recognized as an event but does not model, kept as
     /// its raw JSON so nothing is silently dropped.
     Unknown(serde_json::Value),
+}
+
+/// Maps a Provider's decoded SSE events into the neutral [`StreamEvent`]
+/// vocabulary.
+///
+/// This is the one seam a streaming Provider supplies. Given a decoded
+/// [`SseEvent`], it produces zero or more neutral [`StreamEvent`]s, threading
+/// whatever per-stream state the mapping needs (running usage, the finish
+/// reason, which content-block indices have opened) across calls via `&mut
+/// self`. Everything else in the streaming pipeline — reassembling events off
+/// the byte chunks, buffering the ones a single chunk expands into, propagating
+/// transport errors — lives in [`SseEventStream`] and does not vary by Provider.
+pub(crate) trait StreamNormalizer {
+    /// Map one decoded SSE event to zero or more neutral [`StreamEvent`]s.
+    fn normalize(&mut self, event: &SseEvent) -> Vec<StreamEvent>;
+}
+
+/// Adapts a byte stream into ordered [`StreamEvent`]s by driving a
+/// [`StreamNormalizer`] over the events an [`SseDecoder`] reassembles.
+///
+/// It owns the pipeline for one streamed completion: the [`SseDecoder`] that
+/// reassembles events off the byte chunks, the [`StreamNormalizer`] `N` that
+/// maps each SSE event into the neutral vocabulary, and a queue holding the
+/// events a single chunk expanded into but that have not been yielded yet. The
+/// normalizer is the only part that varies by Provider, so it is injected: each
+/// Provider hands in its own, and a test can drive the pipeline with a scripted
+/// one.
+pub(crate) struct SseEventStream<N> {
+    /// The response body, streamed as byte chunks.
+    bytes: ByteStream,
+    /// Reassembles SSE events straddling chunk boundaries.
+    decoder: SseDecoder,
+    /// Maps SSE events to the neutral vocabulary.
+    normalizer: N,
+    /// Events decoded but not yet yielded to the caller.
+    pending: VecDeque<StreamEvent>,
+    /// Whether the byte stream has ended (or errored).
+    finished: bool,
+}
+
+impl<N: StreamNormalizer> SseEventStream<N> {
+    /// Drive `normalizer` over the SSE events decoded from `bytes`.
+    pub(crate) fn new(bytes: ByteStream, normalizer: N) -> Self {
+        Self {
+            bytes,
+            decoder: SseDecoder::new(),
+            normalizer,
+            pending: VecDeque::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<N: StreamNormalizer + Unpin> futures_core::Stream for SseEventStream<N> {
+    type Item = Result<StreamEvent, Error>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(event) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(event)));
+            }
+            if this.finished {
+                return Poll::Ready(None);
+            }
+
+            match this.bytes.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    for sse in this.decoder.push(&chunk) {
+                        this.pending.extend(this.normalizer.normalize(&sse));
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    this.finished = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None) => {
+                    this.finished = true;
+                    if let Some(sse) = this.decoder.finish() {
+                        this.pending.extend(this.normalizer.normalize(&sse));
+                    }
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 /// A tool call being reassembled from streamed fragments.
@@ -529,5 +621,70 @@ mod tests {
             completion.finish_reason,
             FinishReason::Other(String::new())
         );
+    }
+
+    /// A scripted [`StreamNormalizer`] mapping each decoded [`SseEvent`] to a
+    /// single [`StreamEvent::TextDelta`] carrying its `data`, so a test reads the
+    /// reassembled events straight off the driver's output.
+    struct EchoNormalizer;
+
+    impl StreamNormalizer for EchoNormalizer {
+        fn normalize(&mut self, event: &SseEvent) -> Vec<StreamEvent> {
+            vec![StreamEvent::TextDelta {
+                index: 0,
+                text: event.data.clone(),
+            }]
+        }
+    }
+
+    /// Drive the pipeline over `chunks`, returning the `data` payloads the driver
+    /// surfaced as text deltas.
+    async fn drive(chunks: Vec<Result<Vec<u8>, Error>>) -> Vec<String> {
+        use futures_util::StreamExt;
+        let bytes: ByteStream = futures_util::stream::iter(chunks).boxed();
+        SseEventStream::new(bytes, EchoNormalizer)
+            .map(|event| match event.unwrap() {
+                StreamEvent::TextDelta { text, .. } => text,
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn driver_reassembles_chunk_split_events_and_flushes_the_final_one() {
+        // The first event straddles two chunks; the last carries no terminating
+        // blank line, so only the decoder's `finish` surfaces it.
+        let texts = drive(vec![
+            Ok(b"data: he".to_vec()),
+            Ok(b"llo\n\ndata: wor".to_vec()),
+            Ok(b"ld\n".to_vec()),
+        ])
+        .await;
+        assert_eq!(texts, vec!["hello".to_owned(), "world".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn driver_yields_decoded_events_then_propagates_a_transport_error() {
+        use crate::error::ErrorKind;
+        use futures_util::StreamExt;
+        let bytes: ByteStream = futures_util::stream::iter(vec![
+            Ok(b"data: one\n\n".to_vec()),
+            Err(Error::new(ErrorKind::Transport, "boom")),
+        ])
+        .boxed();
+        let mut stream = SseEventStream::new(bytes, EchoNormalizer);
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            first,
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "one".to_owned(),
+            }
+        );
+        // The error surfaces once, then the stream is done.
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(stream.next().await.is_none());
     }
 }

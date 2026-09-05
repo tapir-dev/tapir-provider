@@ -8,7 +8,7 @@ pub mod oauth;
 
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
-use crate::http::{ByteStream, HttpClient, HttpRequest, Method};
+use crate::http::{HttpClient, HttpRequest, Method};
 use crate::message::{
     AssistantMessage, ContentPart, ImageSource, Message, ToolResultMessage,
 };
@@ -18,16 +18,16 @@ use crate::request::{
     ToolChoice, ToolDefinition,
 };
 use crate::response::{FinishReason, Usage, mint_call_id};
-use crate::sse::{SseDecoder, SseEvent};
-use crate::stream::{StreamEvent, StreamEvents};
+use crate::sse::SseEvent;
+use crate::stream::{
+    SseEventStream, StreamEvent, StreamEvents, StreamNormalizer,
+};
 use crate::token_store::{TokenStore, resolve};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::pin::Pin;
-use std::task::Poll;
 
 /// Default base URL for the Anthropic API.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -435,76 +435,10 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
     ) -> Result<StreamEvents, Error> {
         let http_request = self.build_http_request(ctx, opts, Streaming::On)?;
         let bytes = self.http.send_stream(http_request).await?;
-        Ok(Box::pin(SseEventStream::new(bytes)))
-    }
-}
-
-/// Adapts a byte stream into ordered [`StreamEvent`]s.
-///
-/// It owns the pipeline for one streamed completion: the [`SseDecoder`] that
-/// reassembles events off the byte chunks, the [`StreamNormalizer`] that maps
-/// each Anthropic SSE event into the neutral vocabulary, and a queue holding
-/// the events a single chunk expanded into but that have not been yielded yet.
-struct SseEventStream {
-    /// The response body, streamed as byte chunks.
-    bytes: ByteStream,
-    /// Reassembles SSE events straddling chunk boundaries.
-    decoder: SseDecoder,
-    /// Maps Anthropic SSE events to the neutral vocabulary.
-    normalizer: StreamNormalizer,
-    /// Events decoded but not yet yielded to the caller.
-    pending: VecDeque<StreamEvent>,
-    /// Whether the byte stream has ended (or errored).
-    finished: bool,
-}
-
-impl SseEventStream {
-    fn new(bytes: ByteStream) -> Self {
-        Self {
+        Ok(Box::pin(SseEventStream::new(
             bytes,
-            decoder: SseDecoder::new(),
-            normalizer: StreamNormalizer::default(),
-            pending: VecDeque::new(),
-            finished: false,
-        }
-    }
-}
-
-impl futures_core::Stream for SseEventStream {
-    type Item = Result<StreamEvent, Error>;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(event) = this.pending.pop_front() {
-                return Poll::Ready(Some(Ok(event)));
-            }
-            if this.finished {
-                return Poll::Ready(None);
-            }
-
-            match this.bytes.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    for sse in this.decoder.push(&chunk) {
-                        this.pending.extend(this.normalizer.normalize(&sse));
-                    }
-                }
-                Poll::Ready(Some(Err(err))) => {
-                    this.finished = true;
-                    return Poll::Ready(Some(Err(err)));
-                }
-                Poll::Ready(None) => {
-                    this.finished = true;
-                    if let Some(sse) = this.decoder.finish() {
-                        this.pending.extend(this.normalizer.normalize(&sse));
-                    }
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+            AnthropicStreamNormalizer::default(),
+        )))
     }
 }
 
@@ -516,7 +450,7 @@ impl futures_core::Stream for SseEventStream {
 /// text, thinking, or tool calls (so a `content_block_stop` becomes the matching
 /// `*End` event), and the replay signature accumulated for each thinking block.
 #[derive(Debug, Default)]
-struct StreamNormalizer {
+struct AnthropicStreamNormalizer {
     /// Input tokens, reported in `message_start`.
     input_tokens: u32,
     /// Output tokens, reported cumulatively in `message_delta`.
@@ -537,7 +471,7 @@ struct StreamNormalizer {
     signatures: HashMap<usize, String>,
 }
 
-impl StreamNormalizer {
+impl AnthropicStreamNormalizer {
     /// The token usage seen so far.
     fn usage(&self) -> Usage {
         Usage {
@@ -547,7 +481,9 @@ impl StreamNormalizer {
             cache_write_tokens: self.cache_write_tokens,
         }
     }
+}
 
+impl StreamNormalizer for AnthropicStreamNormalizer {
     /// Map one Anthropic SSE event to zero or more neutral events.
     fn normalize(&mut self, sse: &SseEvent) -> Vec<StreamEvent> {
         // A payload that will not parse is not fatal; surface it verbatim.

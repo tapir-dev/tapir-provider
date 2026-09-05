@@ -10,23 +10,22 @@ pub use embedding::OpenAIEmbeddingProvider;
 
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
-use crate::http::{ByteStream, HttpClient, HttpRequest, Method};
+use crate::http::{HttpClient, HttpRequest, Method};
 use crate::message::{
     AssistantMessage, ContentPart, ImageSource, Message, ToolResultMessage,
 };
 use crate::provider::Provider;
 use crate::request::{CompletionOptions, Context, ToolChoice, ToolDefinition};
 use crate::response::{FinishReason, Usage};
-use crate::sse::{SseDecoder, SseEvent};
-use crate::stream::{StreamEvent, StreamEvents};
+use crate::sse::SseEvent;
+use crate::stream::{
+    SseEventStream, StreamEvent, StreamEvents, StreamNormalizer,
+};
 use crate::token_store::{TokenStore, resolve};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::fmt;
-use std::pin::Pin;
-use std::task::Poll;
 
 /// Default base URL for the OpenAI API.
 pub(super) const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -377,76 +376,10 @@ impl<H: HttpClient> Provider for OpenAIProvider<H> {
     ) -> Result<StreamEvents, Error> {
         let http_request = self.build_http_request(ctx, opts, Streaming::On)?;
         let bytes = self.http.send_stream(http_request).await?;
-        Ok(Box::pin(SseEventStream::new(bytes)))
-    }
-}
-
-/// Adapts a byte stream into ordered [`StreamEvent`]s.
-///
-/// It owns the pipeline for one streamed completion: the [`SseDecoder`] that
-/// reassembles events off the byte chunks, the [`StreamNormalizer`] that maps
-/// each OpenAI SSE event into the neutral vocabulary, and a queue holding the
-/// events a single chunk expanded into but that have not been yielded yet.
-struct SseEventStream {
-    /// The response body, streamed as byte chunks.
-    bytes: ByteStream,
-    /// Reassembles SSE events straddling chunk boundaries.
-    decoder: SseDecoder,
-    /// Maps OpenAI SSE events to the neutral vocabulary.
-    normalizer: StreamNormalizer,
-    /// Events decoded but not yet yielded to the caller.
-    pending: VecDeque<StreamEvent>,
-    /// Whether the byte stream has ended (or errored).
-    finished: bool,
-}
-
-impl SseEventStream {
-    fn new(bytes: ByteStream) -> Self {
-        Self {
+        Ok(Box::pin(SseEventStream::new(
             bytes,
-            decoder: SseDecoder::new(),
-            normalizer: StreamNormalizer::default(),
-            pending: VecDeque::new(),
-            finished: false,
-        }
-    }
-}
-
-impl futures_core::Stream for SseEventStream {
-    type Item = Result<StreamEvent, Error>;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(event) = this.pending.pop_front() {
-                return Poll::Ready(Some(Ok(event)));
-            }
-            if this.finished {
-                return Poll::Ready(None);
-            }
-
-            match this.bytes.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    for sse in this.decoder.push(&chunk) {
-                        this.pending.extend(this.normalizer.normalize(&sse));
-                    }
-                }
-                Poll::Ready(Some(Err(err))) => {
-                    this.finished = true;
-                    return Poll::Ready(Some(Err(err)));
-                }
-                Poll::Ready(None) => {
-                    this.finished = true;
-                    if let Some(sse) = this.decoder.finish() {
-                        this.pending.extend(this.normalizer.normalize(&sse));
-                    }
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+            OpenAIStreamNormalizer::default(),
+        )))
     }
 }
 
@@ -459,7 +392,7 @@ impl futures_core::Stream for SseEventStream {
 /// only in the trailing chunk when `stream_options.include_usage` is set), the
 /// finish reason, and which tool-call indices have already opened.
 #[derive(Debug, Default)]
-struct StreamNormalizer {
+struct OpenAIStreamNormalizer {
     /// Whether the opening `MessageStart` has been emitted.
     started: bool,
     /// The finish reason, reported on the last content chunk.
@@ -474,7 +407,7 @@ struct StreamNormalizer {
     tool_started: Vec<usize>,
 }
 
-impl StreamNormalizer {
+impl StreamNormalizer for OpenAIStreamNormalizer {
     /// Map one OpenAI SSE event to zero or more neutral events.
     fn normalize(&mut self, sse: &SseEvent) -> Vec<StreamEvent> {
         // The sentinel that terminates every OpenAI stream.
@@ -562,7 +495,9 @@ impl StreamNormalizer {
 
         events
     }
+}
 
+impl OpenAIStreamNormalizer {
     /// Map one streamed tool-call fragment, opening the call the first time its
     /// index is seen and emitting an argument delta for any arguments carried.
     fn normalize_tool_call(

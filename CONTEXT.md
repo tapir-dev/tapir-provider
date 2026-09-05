@@ -144,3 +144,11 @@ The model's reasoning, carried as a content part of an Assistant Message and ret
 on the settled reply. It may carry an opaque signature that lets the reasoning be
 replayed to the Provider on a later turn.
 _Avoid_: Reasoning trace, chain of thought, scratchpad.
+
+**Stream Normalizer**:
+The per-Provider seam that maps one decoded SSE event into the Provider-neutral stream
+vocabulary — the ordered Stream Events a streamed completion surfaces — threading the
+little state the mapping needs across events. It is the only part of the streaming
+pipeline that varies by Provider; reassembling events off the byte chunks, buffering
+what one chunk expands into, and propagating transport errors are shared behind it.
+_Avoid_: Parser, decoder (the SSE decoder is a separate, shared concern), event mapper.
