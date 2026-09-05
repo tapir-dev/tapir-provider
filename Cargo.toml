@@ -98,6 +98,12 @@ required-features = ["anthropic", "openai"]
 name = "transform_request_headers"
 required-features = ["anthropic"]
 
+# Cached multi-turn request example; needs the catalog (for cache rates) and the
+# Anthropic Provider.
+[[example]]
+name = "cached_request"
+required-features = ["models", "anthropic"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
