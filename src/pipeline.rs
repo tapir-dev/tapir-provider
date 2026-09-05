@@ -17,11 +17,6 @@
 //! shared fields the pipeline holds (transport, Credential, Model, base URL, and
 //! extra headers).
 
-// The Anthropic Provider rides this pipeline; the OpenAI Provider moves over in
-// later work (see issue #31). A few items are still reached only by the
-// Anthropic path or this module's tests until then.
-#![allow(dead_code)]
-
 use crate::credential::Credential;
 use crate::error::Error;
 use crate::http::{HttpClient, HttpRequest, Method};

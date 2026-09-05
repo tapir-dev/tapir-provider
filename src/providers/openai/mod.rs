@@ -10,17 +10,18 @@ pub use embedding::OpenAIEmbeddingProvider;
 
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
-use crate::http::{HttpClient, HttpRequest, Method};
+use crate::http::HttpClient;
 use crate::message::{
     AssistantMessage, ContentPart, ImageSource, Message, ToolResultMessage,
+};
+use crate::pipeline::{
+    CompletionPipeline, Streaming, WireAdapter, redacted_headers,
 };
 use crate::provider::Provider;
 use crate::request::{CompletionOptions, Context, ToolChoice, ToolDefinition};
 use crate::response::{FinishReason, Usage};
 use crate::sse::SseEvent;
-use crate::stream::{
-    SseEventStream, StreamEvent, StreamEvents, StreamNormalizer,
-};
+use crate::stream::{StreamEvent, StreamEvents, StreamNormalizer};
 use crate::token_store::{TokenStore, resolve};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -45,25 +46,6 @@ pub const INFO: crate::registry::ProviderInfo = crate::registry::ProviderInfo {
     api_key_env: API_KEY_ENV,
 };
 
-/// Whether a request opts into a streamed (SSE) response.
-///
-/// A named alternative to a bare `bool` at the call sites that build the wire
-/// request, so `Streaming::On` reads for itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Streaming {
-    /// Request an incremental SSE response.
-    On,
-    /// Request a single buffered response.
-    Off,
-}
-
-impl Streaming {
-    /// Whether streaming is requested, as the wire `stream` flag.
-    const fn enabled(self) -> bool {
-        matches!(self, Self::On)
-    }
-}
-
 /// The `Authorization` header value for a Credential.
 ///
 /// OpenAI authorizes every request with a `Bearer` token, whether the Credential
@@ -85,43 +67,67 @@ pub(crate) fn auth_headers(credential: &Credential) -> Vec<(String, String)> {
     vec![("authorization".to_owned(), bearer(credential))]
 }
 
-/// A Provider for OpenAI's Chat Completions API.
+/// The OpenAI wire specifics behind the shared [`CompletionPipeline`].
 ///
-/// The transport is injected as the generic `H`, which erases to
-/// `Arc<dyn Provider>` at registration. The addressable Model is fixed when the
-/// Provider is built.
-#[derive(Clone)]
-pub struct OpenAIProvider<H> {
-    http: H,
-    credential: Credential,
-    model: String,
-    base_url: String,
-    /// Caller-supplied headers appended to every request, after the Provider's
-    /// own auth header. For proxies and gateways that key off a bespoke header.
-    extra_headers: Vec<(String, String)>,
-}
+/// It supplies only what genuinely varies for OpenAI: the Chat Completions
+/// endpoint, the `Authorization: Bearer` auth header, the request body, the
+/// response mapping into an [`AssistantMessage`], and the SSE
+/// [`OpenAIStreamNormalizer`]. OpenAI needs no header augmentation, so the
+/// pipeline's defaulted no-op hook stands. The pipeline owns everything
+/// invariant around these, so nothing else about the OpenAI wire lives outside
+/// this adapter.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OpenAIWire;
 
-/// Redacts header *values*, keeping names visible: a caller-supplied header may
-/// carry a secret (a proxy authorization token), so its value never reaches
-/// Debug output — matching the crate's [`Credential`] redaction discipline.
-fn redacted_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
-    headers
-        .iter()
-        .map(|(name, _)| (name.as_str(), "<redacted>"))
-        .collect()
-}
+impl WireAdapter for OpenAIWire {
+    type Response = WireResponse;
+    type Normalizer = OpenAIStreamNormalizer;
 
-impl<H: fmt::Debug> fmt::Debug for OpenAIProvider<H> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OpenAIProvider")
-            .field("http", &self.http)
-            .field("credential", &self.credential)
-            .field("model", &self.model)
-            .field("base_url", &self.base_url)
-            .field("extra_headers", &redacted_headers(&self.extra_headers))
-            .finish()
+    fn endpoint(&self) -> &str {
+        "/v1/chat/completions"
+    }
+
+    fn auth_headers(&self, credential: &Credential) -> Vec<(String, String)> {
+        auth_headers(credential)
+    }
+
+    fn request_body(
+        &self,
+        model: &str,
+        ctx: &Context,
+        opts: &CompletionOptions,
+        streaming: Streaming,
+        _credential: &Credential,
+    ) -> Result<Vec<u8>, Error> {
+        serde_json::to_vec(&WireRequest::from_context(
+            model, ctx, opts, streaming,
+        ))
+        .map_err(Error::serialize)
+    }
+
+    fn map_message(
+        &self,
+        response: WireResponse,
+        raw: serde_json::Value,
+    ) -> AssistantMessage {
+        response.into_message(raw)
+    }
+
+    fn normalizer(&self) -> OpenAIStreamNormalizer {
+        OpenAIStreamNormalizer::default()
     }
 }
+
+/// A Provider for OpenAI's Chat Completions API.
+///
+/// A newtype over the shared `CompletionPipeline` driving an `OpenAIWire`
+/// adapter: the pipeline carries the invariant send / success-gate / decode /
+/// stream-wrap flow and holds the Provider fields (transport `H`, Credential,
+/// Model, base URL, extra headers), while this type preserves the existing
+/// construction surface unchanged. It erases to `Arc<dyn Provider>` at
+/// registration; the addressable Model is fixed when the Provider is built.
+#[derive(Clone, Debug)]
+pub struct OpenAIProvider<H>(CompletionPipeline<H, OpenAIWire>);
 
 impl<H: HttpClient> OpenAIProvider<H> {
     /// Build a Provider for the given Model, authenticating with `credential`
@@ -141,13 +147,13 @@ impl<H: HttpClient> OpenAIProvider<H> {
                 .ok()
                 .flatten()
                 .expect("an explicit Credential always resolves");
-        Self {
+        Self(CompletionPipeline::new(
             http,
+            OpenAIWire,
             credential,
-            model: model.into(),
-            base_url: DEFAULT_BASE_URL.to_owned(),
-            extra_headers: Vec::new(),
-        }
+            model,
+            DEFAULT_BASE_URL,
+        ))
     }
 
     /// Build a Provider by resolving its Credential from a Token Store, then
@@ -189,73 +195,29 @@ impl<H: HttpClient> OpenAIProvider<H> {
 
     /// Override the base URL (for proxies, gateways, or a test server).
     #[must_use]
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
+    pub fn with_base_url(self, base_url: impl Into<String>) -> Self {
+        Self(self.0.with_base_url(base_url))
     }
 
     /// Append an extra header sent with every request, after the Provider's own
     /// auth header.
     #[must_use]
     pub fn with_header(
-        mut self,
+        self,
         name: impl Into<String>,
         value: impl Into<String>,
     ) -> Self {
-        self.extra_headers.push((name.into(), value.into()));
-        self
+        Self(self.0.with_header(name, value))
     }
 
     /// Append extra headers sent with every request, after the Provider's own
     /// auth header.
     #[must_use]
     pub fn with_headers(
-        mut self,
+        self,
         headers: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        self.extra_headers.extend(headers);
-        self
-    }
-
-    fn build_http_request(
-        &self,
-        ctx: &Context,
-        opts: &CompletionOptions,
-        streaming: Streaming,
-    ) -> Result<HttpRequest, Error> {
-        // An explicit per-request key overrides the constructed Credential for
-        // this call.
-        let override_credential =
-            opts.api_key.as_deref().map(Credential::api_key);
-        let credential =
-            override_credential.as_ref().unwrap_or(&self.credential);
-
-        let body = serde_json::to_vec(&WireRequest::from_context(
-            &self.model,
-            ctx,
-            opts,
-            streaming,
-        ))
-        .map_err(Error::serialize)?;
-
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
-        let request = HttpRequest::new(Method::Post, url)
-            .header("content-type", "application/json");
-        // Assemble auth (so the wire matches what auth inspection reports) then
-        // construction-time headers, and let the per-request options append their
-        // static headers and run the Header Transform with the final say.
-        let base = auth_headers(credential)
-            .into_iter()
-            .chain(self.extra_headers.iter().cloned())
-            .collect();
-        let request = opts
-            .finalize_headers(base)
-            .into_iter()
-            .fold(request, |req, (name, value)| req.header(name, value));
-        Ok(request.body(body))
+        Self(self.0.with_headers(headers))
     }
 }
 
@@ -353,20 +315,7 @@ impl<H: HttpClient> Provider for OpenAIProvider<H> {
         ctx: &Context,
         opts: &CompletionOptions,
     ) -> Result<AssistantMessage, Error> {
-        let http_request =
-            self.build_http_request(ctx, opts, Streaming::Off)?;
-        let response = self.http.send(http_request).await?;
-
-        if !response.is_success() {
-            return Err(crate::http::error_from_response(&response));
-        }
-
-        let wire: WireResponse =
-            serde_json::from_slice(&response.body).map_err(Error::decode)?;
-        let raw: serde_json::Value =
-            serde_json::from_slice(&response.body).map_err(Error::decode)?;
-
-        Ok(wire.into_message(raw))
+        self.0.complete(ctx, opts).await
     }
 
     async fn complete_stream(
@@ -374,12 +323,7 @@ impl<H: HttpClient> Provider for OpenAIProvider<H> {
         ctx: &Context,
         opts: &CompletionOptions,
     ) -> Result<StreamEvents, Error> {
-        let http_request = self.build_http_request(ctx, opts, Streaming::On)?;
-        let bytes = self.http.send_stream(http_request).await?;
-        Ok(Box::pin(SseEventStream::new(
-            bytes,
-            OpenAIStreamNormalizer::default(),
-        )))
+        self.0.complete_stream(ctx, opts).await
     }
 }
 
@@ -392,7 +336,7 @@ impl<H: HttpClient> Provider for OpenAIProvider<H> {
 /// only in the trailing chunk when `stream_options.include_usage` is set), the
 /// finish reason, and which tool-call indices have already opened.
 #[derive(Debug, Default)]
-struct OpenAIStreamNormalizer {
+pub(crate) struct OpenAIStreamNormalizer {
     /// Whether the opening `MessageStart` has been emitted.
     started: bool,
     /// The finish reason, reported on the last content chunk.
@@ -819,7 +763,7 @@ fn wire_image_url(source: &ImageSource) -> Cow<'_, str> {
 
 /// The OpenAI Chat Completions response body.
 #[derive(Debug, Deserialize)]
-struct WireResponse {
+pub(crate) struct WireResponse {
     #[serde(default)]
     choices: Vec<WireChoice>,
     #[serde(default)]
@@ -933,7 +877,7 @@ fn map_finish_reason(reason: Option<&str>) -> FinishReason {
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use super::*;
-    use crate::http::MockHttpClient;
+    use crate::http::{Method, MockHttpClient};
     use crate::message::{MediaType, Message};
     use crate::stream::StreamAccumulator;
     use futures_util::StreamExt;
@@ -1483,39 +1427,40 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn builder_layers_base_url_and_headers() {
-        let mock = Arc::new(MockHttpClient::new());
-        let provider = OpenAIProvider::builder(mock, "gpt-4o-mini")
+    #[tokio::test]
+    async fn builder_layers_base_url_and_headers() {
+        let mock =
+            Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
+        let provider = OpenAIProvider::builder(mock.clone(), "gpt-4o-mini")
             .credential(Credential::api_key("sk-test"))
             .base_url("https://proxy.test")
             .header("x-proxy", "1")
             .build()
             .unwrap();
 
-        let http = provider
-            .build_http_request(
-                &Context::new(vec![Message::user("hi")]),
-                &opts(),
-                Streaming::Off,
-            )
-            .unwrap();
+        let ctx = Context::new(vec![Message::user("hi")]);
+        provider.complete(&ctx, &opts()).await.unwrap();
+
+        let sent = mock.last_request();
+        // The override replaces the default host, keeping the API path.
         assert!(
-            http.url
+            sent.url
                 .starts_with("https://proxy.test/v1/chat/completions")
         );
-        assert!(http.headers.iter().any(|(k, v)| k == "x-proxy" && v == "1"));
+        assert!(sent.headers.iter().any(|(k, v)| k == "x-proxy" && v == "1"));
     }
 
-    #[test]
-    fn per_request_headers_and_transform_reach_the_wire_in_order() {
-        let mock = Arc::new(MockHttpClient::new());
-        let provider = OpenAIProvider::builder(mock, "gpt-4o-mini")
+    #[tokio::test]
+    async fn per_request_headers_and_transform_reach_the_wire_in_order() {
+        let mock =
+            Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
+        let provider = OpenAIProvider::builder(mock.clone(), "gpt-4o-mini")
             .credential(Credential::api_key("sk-test"))
             .header("x-tenant", "construction")
             .build()
             .unwrap();
 
+        let ctx = Context::new(vec![Message::user("hi")]);
         let opts = opts()
             // Per-request static headers ride after construction-time ones. One
             // is staged only to be dropped by the transform.
@@ -1530,30 +1475,25 @@ mod tests {
                 headers.push(("x-transformed".to_owned(), "yes".to_owned()));
                 headers
             });
-        let http = provider
-            .build_http_request(
-                &Context::new(vec![Message::user("hi")]),
-                &opts,
-                Streaming::Off,
-            )
-            .unwrap();
+        provider.complete(&ctx, &opts).await.unwrap();
 
+        let sent = mock.last_request();
         assert!(
-            http.headers
+            sent.headers
                 .iter()
                 .any(|(k, v)| k == "authorization" && v == "Bearer sk-test")
         );
-        assert!(!http.headers.iter().any(|(k, _)| k == "x-staged"));
+        assert!(!sent.headers.iter().any(|(k, _)| k == "x-staged"));
 
         // The assembly order holds on the wire: construction-time header, then
         // the per-request static header, then the transform's addition.
         let index = |name: &str| {
-            http.headers.iter().position(|(k, _)| k == name).unwrap()
+            sent.headers.iter().position(|(k, _)| k == name).unwrap()
         };
         assert!(index("x-tenant") < index("x-request-id"));
         assert!(index("x-request-id") < index("x-transformed"));
-        assert_eq!(http.headers[index("x-request-id")].1, "req-1".to_owned());
-        assert_eq!(http.headers[index("x-transformed")].1, "yes".to_owned());
+        assert_eq!(sent.headers[index("x-request-id")].1, "req-1".to_owned());
+        assert_eq!(sent.headers[index("x-transformed")].1, "yes".to_owned());
     }
 
     #[test]
