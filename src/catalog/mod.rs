@@ -6,9 +6,11 @@
 //! Where the [`Registry`] is a zero-sized, compile-time handle over Provider
 //! identity, the Model Registry is a stateful, owned object. It
 //! [`load`](ModelRegistry::load)s the layers of the Catalog — the compiled-in
-//! baseline and, behind `models-user-config`, a user-override TOML layer merged
-//! over it — resolves each entry's Credential through the same Token Store /
-//! environment precedence every construction path uses, and turns a
+//! baseline, behind `models-fetch` a persisted fetched layer merged over it (and
+//! kept fresh by [`refresh`](ModelRegistry::refresh)), and behind
+//! `models-user-config` a user-override TOML layer merged over both (precedence:
+//! user > fetched > baseline) — resolves each entry's Credential through the same
+//! Token Store / environment precedence every construction path uses, and turns a
 //! [`ModelEntry`] into a live `Arc<dyn Provider>` via [`create_provider`]. The
 //! common path is one call:
 //! `ModelRegistry::load(auth, None)?.create_provider("openai", "gpt-4o-mini", http)?`.
@@ -20,6 +22,8 @@
 //! [`available_models`](ModelRegistry::available_models).
 
 mod baseline;
+#[cfg(feature = "models-fetch")]
+mod fetch;
 #[cfg(feature = "models-user-config")]
 mod user_config;
 
@@ -50,12 +54,16 @@ pub struct ModelRegistry {
 impl ModelRegistry {
     /// Load the Catalog and resolve each entry's Credential.
     ///
-    /// The compiled-in baseline layer is loaded first. When the
-    /// `models-user-config` feature is on and `models_path` names an existing
-    /// file, its TOML user-override layer is merged over the baseline (user
-    /// value winning) before Credentials are resolved; a `None` path or a path
-    /// with no file leaves the baseline untouched. Callers discover the
-    /// conventional path with [`user_config_path`].
+    /// The compiled-in baseline layer is loaded first. When the `models-fetch`
+    /// feature is on and a fetched cache sits beside `models_path`, its
+    /// discovered Models are merged over the baseline next (adding Models the
+    /// baseline lacks); a missing or unusable cache is simply skipped. Then, when
+    /// the `models-user-config` feature is on and `models_path` names an existing
+    /// file, its TOML user-override layer is merged over both (user value
+    /// winning) before Credentials are resolved — so precedence is
+    /// user > fetched > baseline. A `None` path, or a path with neither file,
+    /// leaves the baseline untouched. Callers discover the conventional path with
+    /// [`user_config_path`].
     ///
     /// Every entry without an API key already set then has one resolved by
     /// precedence: the `auth` Token Store under the entry's Provider id, else
@@ -76,6 +84,12 @@ impl ModelRegistry {
         models_path: Option<PathBuf>,
     ) -> Result<Self, Error> {
         let mut entries = baseline::entries();
+        #[cfg(feature = "models-fetch")]
+        if let Some(path) = models_path.as_deref()
+            && let Some(cache) = fetch::read_cache(&fetch::cache_path(path))
+        {
+            fetch::apply(&mut entries, &cache);
+        }
         #[cfg(feature = "models-user-config")]
         if let Some(path) = models_path.as_deref()
             && let Some(raw) = read_user_config(path)?
@@ -172,6 +186,48 @@ impl ModelRegistry {
             .find(provider, model)
             .ok_or_else(|| unknown_model(provider, model))?;
         create_provider(entry, transport)
+    }
+
+    /// Refresh the fetched layer: discover each Provider's current Models over
+    /// the network, merge them in, and persist the on-disk cache.
+    ///
+    /// For every Provider in the Catalog with a resolved Credential and a known
+    /// `GET /models` endpoint, this asks over the injected `transport` (so the
+    /// VCR and mock seams still apply) and folds the returned ids into the
+    /// fetched layer, adding any Model the Catalog does not already carry. The
+    /// merge only ever adds — a Model already present from the user or baseline
+    /// layer is left untouched — so precedence stays user > fetched > baseline.
+    ///
+    /// The fetch is best-effort per Provider: one with no Credential, no known
+    /// endpoint, or a failing request keeps its last-known ids rather than
+    /// dropping them. When a `models_path` was given to [`load`](Self::load), the
+    /// updated cache is written beside it (`models.toml` -> `models.fetched.json`,
+    /// within fixed size bounds); with no path the fetched layer updates in
+    /// memory only.
+    ///
+    /// # Errors
+    ///
+    /// [`Other`](crate::ErrorKind::Other) only when the cache cannot be written
+    /// (a filesystem failure or an over-sized cache). A per-Provider fetch
+    /// failure is never surfaced.
+    #[cfg(feature = "models-fetch")]
+    pub async fn refresh<H: HttpClient>(
+        &mut self,
+        transport: &H,
+    ) -> Result<(), Error> {
+        let cache_path = self.models_path.as_deref().map(fetch::cache_path);
+        // Start from the persisted cache so a transient per-Provider failure
+        // leaves that Provider's last-known ids in place.
+        let mut cache = cache_path
+            .as_deref()
+            .and_then(fetch::read_cache)
+            .unwrap_or_else(fetch::FetchedCache::empty);
+        fetch::refresh_into(&mut cache, &self.entries, transport).await;
+        if let Some(path) = cache_path.as_deref() {
+            fetch::write(path, &cache)?;
+        }
+        fetch::apply(&mut self.entries, &cache);
+        Ok(())
     }
 }
 
@@ -506,6 +562,151 @@ mod openai_build_tests {
             panic!("an unknown Model must not build");
         };
         assert_eq!(err.kind(), ErrorKind::InvalidRequest);
+    }
+}
+
+// The fetched layer, exercised end to end: a `refresh` fetches over a VCR
+// cassette, persists the cache, and a fresh `load` reads it back — first from the
+// on-disk cache, then over a replayed refresh that never touches the network.
+#[cfg(all(
+    test,
+    feature = "models-fetch",
+    feature = "test-utils",
+    feature = "openai"
+))]
+mod fetch_tests {
+    use super::*;
+    use crate::http::MockHttpClient;
+    use crate::token_store::InMemoryTokenStore;
+    use crate::vcr::{VcrClient, VcrMode};
+
+    /// A `/models` response naming one baseline Model and one the baseline lacks.
+    const MODELS_RESPONSE: &str = r#"{
+        "object": "list",
+        "data": [
+            {"id": "gpt-4o-mini", "object": "model", "owned_by": "openai"},
+            {"id": "gpt-fetched-model", "object": "model", "owned_by": "openai"}
+        ]
+    }"#;
+
+    /// A unique temp directory, removed with its contents on drop.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "tapir-fetch-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        /// The user-override path (never written); the cache sits beside it.
+        fn models_path(&self) -> PathBuf {
+            self.path.join("models.toml")
+        }
+
+        fn cassette(&self) -> PathBuf {
+            self.path.join("cassette.json")
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn openai_store() -> InMemoryTokenStore {
+        let store = InMemoryTokenStore::new();
+        store
+            .set("openai", Credential::api_key("sk-openai"))
+            .unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn refresh_populates_persists_and_a_later_load_reads_it_back() {
+        let dir = TempDir::new("roundtrip");
+        let store = openai_store();
+
+        // Record a refresh: the fetch flows through the VCR record path against a
+        // fake upstream, populating the fetched layer and writing the cache.
+        let mut registry =
+            ModelRegistry::load(Some(&store), Some(dir.models_path())).unwrap();
+        assert!(registry.find("openai", "gpt-fetched-model").is_none());
+        let recorder = VcrClient::new(
+            MockHttpClient::with_response(200, MODELS_RESPONSE),
+            dir.cassette(),
+            VcrMode::Record,
+        )
+        .unwrap();
+        registry.refresh(&recorder).await.unwrap();
+
+        // The discovered Model is now in the Catalog and, sharing the Provider's
+        // resolved key, is available to call.
+        let fetched = registry.find("openai", "gpt-fetched-model").unwrap();
+        assert!(fetched.api_key.is_some());
+        assert!(
+            registry
+                .available_models()
+                .iter()
+                .any(|e| e.model.id.as_str() == "gpt-fetched-model")
+        );
+        // The cache was persisted beside the user-override path.
+        assert!(fetch::cache_path(&dir.models_path()).exists());
+
+        // A fresh load reads the fetched layer straight from the on-disk cache,
+        // with no network at all.
+        let reloaded =
+            ModelRegistry::load(Some(&store), Some(dir.models_path())).unwrap();
+        assert!(reloaded.find("openai", "gpt-fetched-model").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_replayed_refresh_needs_no_network() {
+        let dir = TempDir::new("replay");
+        let store = openai_store();
+
+        // Record once so the cassette exists.
+        let mut recording =
+            ModelRegistry::load(Some(&store), Some(dir.models_path())).unwrap();
+        let recorder = VcrClient::new(
+            MockHttpClient::with_response(200, MODELS_RESPONSE),
+            dir.cassette(),
+            VcrMode::Record,
+        )
+        .unwrap();
+        recording.refresh(&recorder).await.unwrap();
+
+        // Replay against a transport that panics if contacted: the refresh is
+        // served entirely from the cassette.
+        let mut registry =
+            ModelRegistry::load(Some(&store), Some(dir.models_path())).unwrap();
+        let replayer = VcrClient::new(
+            MockHttpClient::new(),
+            dir.cassette(),
+            VcrMode::Replay,
+        )
+        .unwrap();
+        registry.refresh(&replayer).await.unwrap();
+        assert!(registry.find("openai", "gpt-fetched-model").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_a_credential_is_skipped() {
+        let dir = TempDir::new("nocred");
+        // No Token Store, so no key resolves: the fetch cannot authenticate.
+        let mut registry =
+            ModelRegistry::load(None, Some(dir.models_path())).unwrap();
+        // The transport would panic if a request reached it.
+        let http = MockHttpClient::new();
+        registry.refresh(&http).await.unwrap();
+        assert!(registry.find("openai", "gpt-fetched-model").is_none());
     }
 }
 
