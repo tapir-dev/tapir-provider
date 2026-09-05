@@ -9,12 +9,12 @@ pub mod oauth;
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
 use crate::http::{ByteStream, HttpClient, HttpRequest, Method};
-use crate::message::{ContentPart, ImageSource, Role};
-use crate::provider::Provider;
-use crate::request::{CompletionRequest, ToolChoice, ToolDefinition};
-use crate::response::{
-    CompletionResponse, FinishReason, ToolCall, Usage, mint_call_id,
+use crate::message::{
+    AssistantMessage, ContentPart, ImageSource, Message, ToolResultMessage,
 };
+use crate::provider::Provider;
+use crate::request::{CompletionOptions, Context, ToolChoice, ToolDefinition};
+use crate::response::{FinishReason, Usage, mint_call_id};
 use crate::sse::{SseDecoder, SseEvent};
 use crate::stream::{StreamEvent, StreamEvents};
 use crate::token_store::{TokenStore, resolve};
@@ -24,7 +24,7 @@ use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 
 /// Default base URL for the Anthropic API.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -236,14 +236,16 @@ impl<H: HttpClient> AnthropicProvider<H> {
 
     fn build_http_request(
         &self,
-        request: &CompletionRequest,
+        ctx: &Context,
+        opts: &CompletionOptions,
         streaming: Streaming,
     ) -> Result<HttpRequest, Error> {
         let lane = AuthLane::for_credential(&self.credential);
 
-        let body = serde_json::to_vec(&WireRequest::from_request(
+        let body = serde_json::to_vec(&WireRequest::from_context(
             &self.model,
-            request,
+            ctx,
+            opts,
             streaming,
             lane,
         ))
@@ -367,9 +369,11 @@ impl<H: HttpClient> AnthropicBuilder<H> {
 impl<H: HttpClient> Provider for AnthropicProvider<H> {
     async fn complete(
         &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, Error> {
-        let http_request = self.build_http_request(&request, Streaming::Off)?;
+        ctx: &Context,
+        opts: &CompletionOptions,
+    ) -> Result<AssistantMessage, Error> {
+        let http_request =
+            self.build_http_request(ctx, opts, Streaming::Off)?;
         let response = self.http.send(http_request).await?;
 
         if !response.is_success() {
@@ -381,14 +385,15 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
         let raw: serde_json::Value =
             serde_json::from_slice(&response.body).map_err(Error::decode)?;
 
-        Ok(wire.into_response(raw))
+        Ok(wire.into_message(raw))
     }
 
     async fn complete_stream(
         &self,
-        request: CompletionRequest,
+        ctx: &Context,
+        opts: &CompletionOptions,
     ) -> Result<StreamEvents, Error> {
-        let http_request = self.build_http_request(&request, Streaming::On)?;
+        let http_request = self.build_http_request(ctx, opts, Streaming::On)?;
         let bytes = self.http.send_stream(http_request).await?;
         Ok(Box::pin(SseEventStream::new(bytes)))
     }
@@ -430,7 +435,7 @@ impl futures_core::Stream for SseEventStream {
 
     fn poll_next(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
@@ -616,45 +621,17 @@ fn is_false(flag: &bool) -> bool {
 }
 
 impl<'a> WireRequest<'a> {
-    fn from_request(
+    fn from_context(
         model: &'a str,
-        request: &'a CompletionRequest,
+        ctx: &'a Context,
+        opts: &'a CompletionOptions,
         streaming: Streaming,
         lane: AuthLane,
     ) -> Self {
-        let mut messages = Vec::new();
-        let mut system_parts = Vec::new();
+        let messages = ctx.messages.iter().map(wire_message).collect();
+        let system = wire_system(ctx.system_prompt.clone(), lane);
 
-        for message in &request.messages {
-            match message.role {
-                Role::System => {
-                    // Anthropic's `system` field is text-only; drop any
-                    // non-text parts in a system message.
-                    for part in &message.content {
-                        if let ContentPart::Text(text) = part {
-                            system_parts.push(text.as_str());
-                        }
-                    }
-                }
-                Role::User => messages.push(WireMessage {
-                    role: "user",
-                    content: wire_content(&message.content),
-                }),
-                Role::Assistant => messages.push(WireMessage {
-                    role: "assistant",
-                    content: wire_content(&message.content),
-                }),
-            }
-        }
-
-        let caller_system = if system_parts.is_empty() {
-            None
-        } else {
-            Some(system_parts.join("\n\n"))
-        };
-        let system = wire_system(caller_system, lane);
-
-        let tools = request
+        let tools = ctx
             .tools
             .iter()
             .map(|tool| WireTool::from_tool(tool, lane))
@@ -662,15 +639,61 @@ impl<'a> WireRequest<'a> {
 
         Self {
             model,
-            max_tokens: request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            max_tokens: opts.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             messages,
-            temperature: request.temperature,
+            temperature: opts.temperature,
             system,
             tools,
-            tool_choice: request.tool_choice.as_ref().map(wire_tool_choice),
+            tool_choice: opts.tool_choice.as_ref().map(wire_tool_choice),
             stream: streaming.enabled(),
         }
     }
+}
+
+/// Map one neutral [`Message`] onto an Anthropic request message.
+///
+/// A tool result is carried, per the Messages API, as a `user` message whose
+/// content is a single `tool_result` block referencing the call by id.
+fn wire_message(message: &Message) -> WireMessage<'_> {
+    match message {
+        Message::User { content } => WireMessage {
+            role: "user",
+            content: wire_content(content),
+        },
+        Message::Assistant(assistant) => WireMessage {
+            role: "assistant",
+            content: wire_content(&assistant.content),
+        },
+        Message::ToolResult(result) => WireMessage {
+            role: "user",
+            content: wire_tool_result(result),
+        },
+    }
+}
+
+/// A [`ToolResultMessage`] as a single-block `user` content on the wire.
+fn wire_tool_result(result: &ToolResultMessage) -> WireContent<'_> {
+    WireContent::Blocks(vec![WireContentPart::ToolResult {
+        tool_use_id: &result.tool_call_id,
+        content: tool_result_text(&result.content),
+        is_error: result.is_error,
+    }])
+}
+
+/// The text of a tool result's content, borrowing a lone text part and joining
+/// several. Non-text parts are dropped.
+fn tool_result_text(parts: &[ContentPart]) -> Cow<'_, str> {
+    if let [ContentPart::Text(text)] = parts {
+        return Cow::Borrowed(text.as_str());
+    }
+    let joined: String = parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    Cow::Owned(joined)
 }
 
 /// A message's `system` prompt on the wire.
@@ -802,10 +825,25 @@ enum WireContent<'a> {
 
 /// One content block in the Anthropic request body.
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum WireContentPart<'a> {
-    Text { text: &'a str },
-    Image { source: WireImageSource<'a> },
+    Text {
+        text: &'a str,
+    },
+    Image {
+        source: WireImageSource<'a>,
+    },
+    ToolUse {
+        id: &'a str,
+        name: &'a str,
+        input: &'a serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: &'a str,
+        content: Cow<'a, str>,
+        #[serde(skip_serializing_if = "is_false")]
+        is_error: bool,
+    },
 }
 
 /// An image block's `source` in the Anthropic request body.
@@ -825,6 +863,9 @@ enum WireImageSource<'a> {
 }
 
 /// Map neutral content parts onto Anthropic's message content.
+///
+/// A lone text part serializes as the compact string form; anything else —
+/// images, tool calls, or multiple parts — serializes as typed blocks.
 fn wire_content(parts: &[ContentPart]) -> WireContent<'_> {
     if let [ContentPart::Text(text)] = parts {
         return WireContent::Text(text.as_str());
@@ -838,6 +879,15 @@ fn wire_content_part(part: &ContentPart) -> WireContentPart<'_> {
         ContentPart::Text(text) => WireContentPart::Text { text },
         ContentPart::Image(source) => WireContentPart::Image {
             source: wire_image_source(source),
+        },
+        ContentPart::ToolCall {
+            id,
+            name,
+            arguments,
+        } => WireContentPart::ToolUse {
+            id,
+            name,
+            input: arguments,
         },
     }
 }
@@ -868,36 +918,31 @@ struct WireResponse {
 }
 
 impl WireResponse {
-    fn into_response(self, raw: serde_json::Value) -> CompletionResponse {
-        let text = self
-            .content
-            .iter()
-            .filter(|block| block.block_type == "text")
-            .map(|block| block.text.as_str())
-            .collect::<Vec<_>>()
-            .concat();
+    fn into_message(self, raw: serde_json::Value) -> AssistantMessage {
+        // Preserve wire order so text and tool calls interleave as they arrived.
+        let mut content = Vec::new();
+        for block in self.content {
+            match block.block_type.as_str() {
+                "text" if !block.text.is_empty() => {
+                    content.push(ContentPart::Text(block.text));
+                }
+                "tool_use" => content.push(ContentPart::ToolCall {
+                    id: block.id.unwrap_or_else(mint_call_id),
+                    name: block.name,
+                    arguments: block.input,
+                }),
+                _ => {}
+            }
+        }
 
-        let tool_calls = self
-            .content
-            .into_iter()
-            .filter(|block| block.block_type == "tool_use")
-            .map(|block| ToolCall {
-                id: mint_call_id(),
-                native_id: block.id,
-                name: block.name,
-                arguments: block.input,
-            })
-            .collect();
-
-        CompletionResponse {
-            text,
-            tool_calls,
+        AssistantMessage {
+            content,
             usage: Usage {
                 input_tokens: self.usage.input_tokens,
                 output_tokens: self.usage.output_tokens,
             },
             finish_reason: map_finish_reason(self.stop_reason),
-            raw,
+            raw: Some(raw),
         }
     }
 }
@@ -950,8 +995,31 @@ mod tests {
     use futures_util::StreamExt;
     use std::time::Duration;
 
-    /// Send one request and return its parsed JSON body.
-    async fn sent_body(request: CompletionRequest) -> serde_json::Value {
+    /// The default, empty per-request options.
+    fn opts() -> CompletionOptions {
+        CompletionOptions::default()
+    }
+
+    /// The tool calls in a reply, as `(id, name, arguments)` tuples in order.
+    fn tool_calls(
+        message: &AssistantMessage,
+    ) -> Vec<(&str, &str, &serde_json::Value)> {
+        message
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.as_str(), name.as_str(), arguments)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Send one context and return its parsed JSON body.
+    async fn sent_body(ctx: Context) -> serde_json::Value {
         let mock = std::sync::Arc::new(MockHttpClient::with_response(
             200,
             SAMPLE_RESPONSE,
@@ -961,7 +1029,7 @@ mod tests {
             Credential::api_key("sk-test"),
             "claude-3-5-sonnet",
         );
-        provider.complete(request).await.unwrap();
+        provider.complete(&ctx, &opts()).await.unwrap();
         serde_json::from_slice(mock.last_request().body.as_deref().unwrap())
             .unwrap()
     }
@@ -989,9 +1057,9 @@ mod tests {
     async fn collect_stream(
         provider: &AnthropicProvider<std::sync::Arc<MockHttpClient>>,
     ) -> Vec<StreamEvent> {
-        let request = CompletionRequest::new(vec![Message::user("hi")]);
+        let ctx = Context::new(vec![Message::user("hi")]);
         provider
-            .complete_stream(request)
+            .complete_stream(&ctx, &opts())
             .await
             .unwrap()
             .map(Result::unwrap)
@@ -1021,14 +1089,14 @@ mod tests {
             "claude-3-5-sonnet-20241022",
         );
 
-        let request = CompletionRequest::new(vec![Message::user("Hello")]);
-        let response = provider.complete(request).await.unwrap();
+        let ctx = Context::new(vec![Message::user("Hello")]);
+        let response = provider.complete(&ctx, &opts()).await.unwrap();
 
-        assert_eq!(response.text, "Hello there!");
+        assert_eq!(response.text_content(), "Hello there!");
         assert_eq!(response.usage.input_tokens, 12);
         assert_eq!(response.usage.output_tokens, 5);
         assert_eq!(response.finish_reason, FinishReason::Stop);
-        assert_eq!(response.raw["id"], "msg_123");
+        assert_eq!(response.raw.as_ref().unwrap()["id"], "msg_123");
     }
 
     #[tokio::test]
@@ -1051,14 +1119,12 @@ mod tests {
         )
         .unwrap();
 
-        let response = provider
-            .complete(CompletionRequest::new(vec![Message::user("Hello")]))
-            .await
-            .unwrap();
+        let ctx = Context::new(vec![Message::user("Hello")]);
+        let response = provider.complete(&ctx, &opts()).await.unwrap();
 
         // Same completion as the explicit-Credential path, and the resolved
         // key is what reached the wire.
-        assert_eq!(response.text, "Hello there!");
+        assert_eq!(response.text_content(), "Hello there!");
         assert!(
             mock.last_request()
                 .headers
@@ -1079,13 +1145,10 @@ mod tests {
             "claude-3-5-sonnet-20241022",
         );
 
-        let request = CompletionRequest::new(vec![
-            Message::system("Be terse."),
-            Message::user("Hi"),
-        ])
-        .with_temperature(0.2)
-        .with_max_tokens(64);
-        provider.complete(request).await.unwrap();
+        let ctx =
+            Context::new(vec![Message::user("Hi")]).with_system("Be terse.");
+        let opts = opts().with_temperature(0.2).with_max_tokens(64);
+        provider.complete(&ctx, &opts).await.unwrap();
 
         let sent = mock.last_request();
         assert_eq!(sent.method, Method::Post);
@@ -1124,10 +1187,8 @@ mod tests {
             .build()
             .unwrap();
 
-        provider
-            .complete(CompletionRequest::new(vec![Message::user("hi")]))
-            .await
-            .unwrap();
+        let ctx = Context::new(vec![Message::user("hi")]);
+        provider.complete(&ctx, &opts()).await.unwrap();
 
         let sent = mock.last_request();
         // The override replaces the default host, keeping the API path.
@@ -1165,6 +1226,21 @@ mod tests {
 
     #[tokio::test]
     async fn tool_definitions_and_choice_map_onto_the_wire_body() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        });
+        let ctx =
+            Context::new(vec![Message::user("weather?")]).with_tools(vec![
+                ToolDefinition::new(
+                    "get_weather",
+                    "Look up the weather for a city",
+                    schema.clone(),
+                ),
+            ]);
+        let opts =
+            opts().with_tool_choice(ToolChoice::Tool("get_weather".to_owned()));
         let mock = std::sync::Arc::new(MockHttpClient::with_response(
             200,
             SAMPLE_RESPONSE,
@@ -1174,20 +1250,7 @@ mod tests {
             Credential::api_key("sk-test"),
             "claude-3-5-sonnet",
         );
-
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {"city": {"type": "string"}},
-            "required": ["city"],
-        });
-        let request = CompletionRequest::new(vec![Message::user("weather?")])
-            .with_tools(vec![ToolDefinition::new(
-                "get_weather",
-                "Look up the weather for a city",
-                schema.clone(),
-            )])
-            .with_tool_choice(ToolChoice::Tool("get_weather".to_owned()));
-        provider.complete(request).await.unwrap();
+        provider.complete(&ctx, &opts).await.unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(
             mock.last_request().body.as_deref().unwrap(),
@@ -1205,26 +1268,56 @@ mod tests {
 
     #[tokio::test]
     async fn omits_tools_and_choice_when_unset() {
-        let mock = std::sync::Arc::new(MockHttpClient::with_response(
-            200,
-            SAMPLE_RESPONSE,
-        ));
-        let provider = AnthropicProvider::new(
-            mock.clone(),
-            Credential::api_key("sk-test"),
-            "claude-3-5-sonnet",
-        );
-        provider
-            .complete(CompletionRequest::new(vec![Message::user("hi")]))
-            .await
-            .unwrap();
-
-        let body: serde_json::Value = serde_json::from_slice(
-            mock.last_request().body.as_deref().unwrap(),
-        )
-        .unwrap();
+        let body = sent_body(Context::new(vec![Message::user("hi")])).await;
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[tokio::test]
+    async fn assistant_tool_call_and_tool_result_round_trip_onto_the_wire() {
+        let ctx = Context::new(vec![
+            Message::user("weather?"),
+            Message::Assistant(AssistantMessage {
+                content: vec![ContentPart::tool_call(
+                    "toolu_7",
+                    "get_weather",
+                    serde_json::json!({"city": "Paris"}),
+                )],
+                usage: Usage::default(),
+                finish_reason: FinishReason::ToolUse,
+                raw: None,
+            }),
+            Message::tool_result("toolu_7", "get_weather", "sunny"),
+        ]);
+        let body = sent_body(ctx).await;
+
+        // The assistant tool call serializes as a `tool_use` block.
+        let assistant = &body["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"][0]["type"], "tool_use");
+        assert_eq!(assistant["content"][0]["id"], "toolu_7");
+        assert_eq!(assistant["content"][0]["name"], "get_weather");
+        assert_eq!(assistant["content"][0]["input"]["city"], "Paris");
+        // The result is a `user` message carrying a `tool_result` block.
+        let result = &body["messages"][2];
+        assert_eq!(result["role"], "user");
+        assert_eq!(result["content"][0]["type"], "tool_result");
+        assert_eq!(result["content"][0]["tool_use_id"], "toolu_7");
+        assert_eq!(result["content"][0]["content"], "sunny");
+        // A successful result omits the error flag.
+        assert!(result["content"][0].get("is_error").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_errored_tool_result_sets_the_error_flag() {
+        let ctx = Context::new(vec![Message::ToolResult(ToolResultMessage {
+            tool_call_id: "toolu_1".to_owned(),
+            tool_name: "get_weather".to_owned(),
+            content: vec![ContentPart::text("boom")],
+            is_error: true,
+        })]);
+        let body = sent_body(ctx).await;
+        assert_eq!(body["messages"][0]["content"][0]["is_error"], true);
     }
 
     /// Build an OAuth-authenticated Provider over the given mock.
@@ -1249,10 +1342,8 @@ mod tests {
             SAMPLE_RESPONSE,
         ));
         let provider = oauth_provider(mock.clone());
-        provider
-            .complete(CompletionRequest::new(vec![Message::user("Hi")]))
-            .await
-            .unwrap();
+        let ctx = Context::new(vec![Message::user("Hi")]);
+        provider.complete(&ctx, &opts()).await.unwrap();
 
         let sent = mock.last_request();
         // The Bearer lane replaces `x-api-key` entirely.
@@ -1282,11 +1373,9 @@ mod tests {
             SAMPLE_RESPONSE,
         ));
         let provider = oauth_provider(mock.clone());
-        let request = CompletionRequest::new(vec![
-            Message::system("Be terse."),
-            Message::user("Hi"),
-        ]);
-        provider.complete(request).await.unwrap();
+        let ctx =
+            Context::new(vec![Message::user("Hi")]).with_system("Be terse.");
+        provider.complete(&ctx, &opts()).await.unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(
             mock.last_request().body.as_deref().unwrap(),
@@ -1305,10 +1394,8 @@ mod tests {
             SAMPLE_RESPONSE,
         ));
         let provider = oauth_provider(mock.clone());
-        provider
-            .complete(CompletionRequest::new(vec![Message::user("Hi")]))
-            .await
-            .unwrap();
+        let ctx = Context::new(vec![Message::user("Hi")]);
+        provider.complete(&ctx, &opts()).await.unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(
             mock.last_request().body.as_deref().unwrap(),
@@ -1327,13 +1414,15 @@ mod tests {
         ));
         let provider = oauth_provider(mock.clone());
         let schema = serde_json::json!({"type": "object"});
-        let request = CompletionRequest::new(vec![Message::user("weather?")])
-            .with_tools(vec![ToolDefinition::new(
-                "get.weather now!",
-                "Look up the weather",
-                schema,
-            )]);
-        provider.complete(request).await.unwrap();
+        let ctx =
+            Context::new(vec![Message::user("weather?")]).with_tools(vec![
+                ToolDefinition::new(
+                    "get.weather now!",
+                    "Look up the weather",
+                    schema,
+                ),
+            ]);
+        provider.complete(&ctx, &opts()).await.unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(
             mock.last_request().body.as_deref().unwrap(),
@@ -1354,9 +1443,9 @@ mod tests {
             "claude-3-5-sonnet",
         );
         let schema = serde_json::json!({"type": "object"});
-        let request = CompletionRequest::new(vec![Message::user("weather?")])
+        let ctx = Context::new(vec![Message::user("weather?")])
             .with_tools(vec![ToolDefinition::new("get.weather", "d", schema)]);
-        provider.complete(request).await.unwrap();
+        provider.complete(&ctx, &opts()).await.unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(
             mock.last_request().body.as_deref().unwrap(),
@@ -1384,11 +1473,11 @@ mod tests {
 
     #[tokio::test]
     async fn url_image_and_text_mix_within_one_user_message() {
-        let request = CompletionRequest::new(vec![
+        let ctx = Context::new(vec![
             Message::user("what is this?")
                 .with_image(ImageSource::url("https://example.com/cat.png")),
         ]);
-        let body = sent_body(request).await;
+        let body = sent_body(ctx).await;
 
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["type"], "text");
@@ -1400,14 +1489,11 @@ mod tests {
 
     #[tokio::test]
     async fn base64_image_carries_its_media_type_to_the_wire() {
-        let request = CompletionRequest::new(vec![Message::from_parts(
-            Role::User,
-            vec![ContentPart::image(ImageSource::base64(
-                MediaType::Jpeg,
-                "aGk=",
-            ))],
-        )]);
-        let body = sent_body(request).await;
+        let ctx =
+            Context::new(vec![Message::user_parts(vec![ContentPart::image(
+                ImageSource::base64(MediaType::Jpeg, "aGk="),
+            )])]);
+        let body = sent_body(ctx).await;
 
         let source = &body["messages"][0]["content"][0]["source"];
         assert_eq!(source["type"], "base64");
@@ -1417,14 +1503,11 @@ mod tests {
 
     #[tokio::test]
     async fn raw_bytes_image_is_base64_encoded_with_media_type() {
-        let request = CompletionRequest::new(vec![Message::from_parts(
-            Role::User,
-            vec![ContentPart::image(ImageSource::bytes(
-                MediaType::Png,
-                b"hi".to_vec(),
-            ))],
-        )]);
-        let body = sent_body(request).await;
+        let ctx =
+            Context::new(vec![Message::user_parts(vec![ContentPart::image(
+                ImageSource::bytes(MediaType::Png, b"hi".to_vec()),
+            )])]);
+        let body = sent_body(ctx).await;
 
         let source = &body["messages"][0]["content"][0]["source"];
         assert_eq!(source["type"], "base64");
@@ -1434,7 +1517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_use_response_normalizes_with_both_ids() {
+    async fn tool_use_response_normalizes_to_a_content_part() {
         let response = r#"{
             "id": "msg_tool",
             "content": [
@@ -1452,19 +1535,18 @@ mod tests {
             "claude-3-5-sonnet",
         );
 
-        let completion = provider
-            .complete(CompletionRequest::new(vec![Message::user("weather?")]))
-            .await
-            .unwrap();
+        let ctx = Context::new(vec![Message::user("weather?")]);
+        let completion = provider.complete(&ctx, &opts()).await.unwrap();
 
-        assert_eq!(completion.text, "Let me check.");
+        assert_eq!(completion.text_content(), "Let me check.");
         assert_eq!(completion.finish_reason, FinishReason::ToolUse);
-        assert_eq!(completion.tool_calls.len(), 1);
-        let call = &completion.tool_calls[0];
-        assert_eq!(call.native_id.as_deref(), Some("toolu_42"));
-        assert!(!call.id.is_empty());
-        assert_eq!(call.name, "get_weather");
-        assert_eq!(call.arguments, serde_json::json!({"city": "Paris"}));
+        let calls = tool_calls(&completion);
+        assert_eq!(calls.len(), 1);
+        let (id, name, arguments) = calls[0];
+        // The native tool-use id becomes the part's stable handle.
+        assert_eq!(id, "toolu_42");
+        assert_eq!(name, "get_weather");
+        assert_eq!(arguments, &serde_json::json!({"city": "Paris"}));
     }
 
     #[tokio::test]
@@ -1479,10 +1561,8 @@ mod tests {
             "claude-3-5-sonnet",
         );
 
-        let err = provider
-            .complete(CompletionRequest::new(vec![Message::user("hi")]))
-            .await
-            .unwrap_err();
+        let ctx = Context::new(vec![Message::user("hi")]);
+        let err = provider.complete(&ctx, &opts()).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::Authentication);
         assert_eq!(err.status(), Some(401));
@@ -1503,10 +1583,8 @@ mod tests {
                 Credential::api_key("k"),
                 "claude-3-5-sonnet",
             );
-            let err = provider
-                .complete(CompletionRequest::new(vec![Message::user("hi")]))
-                .await
-                .unwrap_err();
+            let ctx = Context::new(vec![Message::user("hi")]);
+            let err = provider.complete(&ctx, &opts()).await.unwrap_err();
             assert_eq!(err.kind(), kind, "status {status}");
         }
     }
@@ -1525,10 +1603,8 @@ mod tests {
             "claude-3-5-sonnet",
         );
 
-        let err = provider
-            .complete(CompletionRequest::new(vec![Message::user("hi")]))
-            .await
-            .unwrap_err();
+        let ctx = Context::new(vec![Message::user("hi")]);
+        let err = provider.complete(&ctx, &opts()).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::RateLimited);
         assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
@@ -1607,7 +1683,7 @@ mod tests {
         let events = collect_stream(&provider).await;
         let folded = StreamAccumulator::fold(&events);
 
-        assert_eq!(folded.text, "Hello, world");
+        assert_eq!(folded.text_content(), "Hello, world");
         assert_eq!(folded.finish_reason, FinishReason::Stop);
         assert_eq!(folded.usage.input_tokens, 7);
         assert_eq!(folded.usage.output_tokens, 5);
@@ -1671,7 +1747,7 @@ mod tests {
             }
         );
         // Reasoning never contributes to the folded completion text.
-        assert_eq!(StreamAccumulator::fold(&events).text, "");
+        assert_eq!(StreamAccumulator::fold(&events).text_content(), "");
     }
 
     #[tokio::test]
@@ -1744,11 +1820,11 @@ mod tests {
         let folded = StreamAccumulator::fold(&events);
 
         assert_eq!(folded.finish_reason, FinishReason::ToolUse);
-        assert_eq!(folded.tool_calls.len(), 1);
-        let call = &folded.tool_calls[0];
-        assert_eq!(call.native_id.as_deref(), Some("toolu_9"));
-        assert!(!call.id.is_empty());
-        assert_eq!(call.name, "get_weather");
-        assert_eq!(call.arguments, serde_json::json!({"city": "Paris"}));
+        let calls = tool_calls(&folded);
+        assert_eq!(calls.len(), 1);
+        let (id, name, arguments) = calls[0];
+        assert_eq!(id, "toolu_9");
+        assert_eq!(name, "get_weather");
+        assert_eq!(arguments, &serde_json::json!({"city": "Paris"}));
     }
 }

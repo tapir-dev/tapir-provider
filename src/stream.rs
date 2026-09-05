@@ -2,19 +2,18 @@
 // SPDX-FileCopyrightText: 2026 Murilo Ijanc' <murilo@ijanc.org>
 
 //! The streaming vocabulary: incremental [`StreamEvent`]s and the
-//! [`StreamAccumulator`] that folds them back into a [`CompletionResponse`].
+//! [`StreamAccumulator`] that folds them back into an [`AssistantMessage`].
 //!
 //! A Provider that streams surfaces a completion as an ordered sequence of
 //! [`StreamEvent`]s. Each event is Provider-neutral and carries a content
 //! `index` so deltas can be correlated to the content block they belong to. A
 //! caller that only wants the final answer can ignore every delta and fold the
-//! whole stream through a [`StreamAccumulator`], arriving at the same normalized
-//! completion the non-streaming path would produce.
+//! whole stream through a [`StreamAccumulator`], arriving at the same
+//! [`AssistantMessage`] the non-streaming path would produce.
 
 use crate::error::Error;
-use crate::response::{
-    CompletionResponse, FinishReason, ToolCall, Usage, mint_call_id,
-};
+use crate::message::{AssistantMessage, ContentPart};
+use crate::response::{FinishReason, Usage, mint_call_id};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 
@@ -101,14 +100,14 @@ struct PartialToolCall {
     json: String,
 }
 
-/// Folds a stream of [`StreamEvent`]s into a normalized [`CompletionResponse`].
+/// Folds a stream of [`StreamEvent`]s into an [`AssistantMessage`].
 ///
 /// The accumulator is Provider-neutral: it concatenates text deltas per content
-/// block (joining blocks in `index` order, matching the non-streaming path),
-/// reassembles tool-call fragments keyed by content index, tracks the running
-/// usage, and records the finish reason from the terminal [`StreamEvent::Done`].
-/// Reasoning events and tool-call arguments do not contribute to the completion
-/// text, mirroring the non-streaming response shape.
+/// block, reassembles tool-call fragments keyed by content index, tracks the
+/// running usage, and records the finish reason from the terminal
+/// [`StreamEvent::Done`]. Content parts (text and tool calls) are emitted in
+/// `index` order, matching the non-streaming path. Reasoning events do not
+/// contribute to the settled message, mirroring the non-streaming shape.
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
     /// Text accumulated per content-block index, kept ordered by index.
@@ -164,7 +163,7 @@ impl StreamAccumulator {
     }
 
     /// Fold every event from an iterator, then finish.
-    pub fn fold<'a, I>(iter: I) -> CompletionResponse
+    pub fn fold<'a, I>(iter: I) -> AssistantMessage
     where
         I: IntoIterator<Item = &'a StreamEvent>,
     {
@@ -175,33 +174,38 @@ impl StreamAccumulator {
         acc.finish()
     }
 
-    /// Produce the completion the folded events describe.
+    /// Produce the [`AssistantMessage`] the folded events describe.
     ///
-    /// Absent a terminal `Done` event, the finish reason falls back to an empty
-    /// [`FinishReason::Other`], the same placeholder the non-streaming path uses
-    /// for a missing stop reason.
+    /// Content parts are ordered by their content-block index, so text and tool
+    /// calls interleave the way they arrived. Absent a terminal `Done` event,
+    /// the finish reason falls back to an empty [`FinishReason::Other`], the
+    /// same placeholder the non-streaming path uses for a missing stop reason.
     #[must_use]
-    pub fn finish(self) -> CompletionResponse {
-        let text = self.text.into_values().collect::<Vec<_>>().concat();
-        let tool_calls = self
-            .tool_calls
-            .into_values()
-            .map(|call| ToolCall {
-                id: mint_call_id(),
-                native_id: call.native_id,
-                name: call.name,
-                arguments: parse_arguments(&call.json),
-            })
-            .collect();
-        CompletionResponse {
-            text,
-            tool_calls,
+    pub fn finish(self) -> AssistantMessage {
+        // Merge text and tool-call blocks into one index-ordered part list, so
+        // the settled content matches the order the blocks streamed in.
+        let mut parts: BTreeMap<usize, ContentPart> = BTreeMap::new();
+        for (index, text) in self.text {
+            parts.insert(index, ContentPart::Text(text));
+        }
+        for (index, call) in self.tool_calls {
+            parts.insert(
+                index,
+                ContentPart::ToolCall {
+                    id: call.native_id.unwrap_or_else(mint_call_id),
+                    name: call.name,
+                    arguments: parse_arguments(&call.json),
+                },
+            );
+        }
+        AssistantMessage {
+            content: parts.into_values().collect(),
             usage: self.usage,
             finish_reason: self
                 .finish_reason
                 .unwrap_or(FinishReason::Other(String::new())),
-            // The stream has no single raw body; the escape hatch is empty.
-            raw: serde_json::Value::Null,
+            // The stream has no single raw body; the escape hatch is absent.
+            raw: None,
         }
     }
 }
@@ -218,6 +222,25 @@ fn parse_arguments(json: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tool calls in a folded message, as `(id, name, arguments)` tuples in
+    /// content order.
+    fn tool_calls(
+        message: &AssistantMessage,
+    ) -> Vec<(&str, &str, &serde_json::Value)> {
+        message
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.as_str(), name.as_str(), arguments)),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn folds_ordered_text_deltas_into_one_completion() {
@@ -241,7 +264,7 @@ mod tests {
         ];
 
         let completion = StreamAccumulator::fold(&events);
-        assert_eq!(completion.text, "Hello, world");
+        assert_eq!(completion.text_content(), "Hello, world");
         assert_eq!(completion.usage.input_tokens, 3);
         assert_eq!(completion.usage.output_tokens, 4);
         assert_eq!(completion.finish_reason, FinishReason::Stop);
@@ -264,7 +287,10 @@ mod tests {
                 usage: Usage::default(),
             },
         ];
-        assert_eq!(StreamAccumulator::fold(&events).text, "first second");
+        assert_eq!(
+            StreamAccumulator::fold(&events).text_content(),
+            "first second"
+        );
     }
 
     #[test]
@@ -290,7 +316,7 @@ mod tests {
             },
         ];
         let completion = StreamAccumulator::fold(&events);
-        assert_eq!(completion.text, "");
+        assert_eq!(completion.text_content(), "");
         assert_eq!(completion.finish_reason, FinishReason::ToolUse);
     }
 
@@ -318,12 +344,13 @@ mod tests {
             },
         ];
         let completion = StreamAccumulator::fold(&events);
-        assert_eq!(completion.tool_calls.len(), 1);
-        let call = &completion.tool_calls[0];
-        assert_eq!(call.native_id.as_deref(), Some("toolu_1"));
-        assert_eq!(call.name, "get_weather");
-        assert_eq!(call.arguments, serde_json::json!({"city": "Paris"}));
-        assert!(!call.id.is_empty());
+        let calls = tool_calls(&completion);
+        assert_eq!(calls.len(), 1);
+        let (id, name, arguments) = calls[0];
+        // The native id carries straight through as the call's stable handle.
+        assert_eq!(id, "toolu_1");
+        assert_eq!(name, "get_weather");
+        assert_eq!(arguments, &serde_json::json!({"city": "Paris"}));
     }
 
     #[test]
@@ -353,16 +380,10 @@ mod tests {
             },
         ];
         let completion = StreamAccumulator::fold(&events);
-        let names: Vec<_> = completion
-            .tool_calls
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect();
+        let calls = tool_calls(&completion);
+        let names: Vec<_> = calls.iter().map(|(_, name, _)| *name).collect();
         assert_eq!(names, vec!["a", "b"]);
-        assert_eq!(
-            completion.tool_calls[0].arguments,
-            serde_json::json!({"x": 1})
-        );
+        assert_eq!(calls[0].2, &serde_json::json!({"x": 1}));
     }
 
     #[test]
@@ -384,9 +405,9 @@ mod tests {
             },
         ];
         let completion = StreamAccumulator::fold(&events);
-        let call = &completion.tool_calls[0];
-        assert_eq!(call.native_id, None);
-        assert!(!call.id.is_empty());
+        let calls = tool_calls(&completion);
+        // No native id, so the call still gets a minted, non-empty handle.
+        assert!(!calls[0].0.is_empty());
     }
 
     #[test]
@@ -415,7 +436,7 @@ mod tests {
             text: "partial".to_owned(),
         }];
         let completion = StreamAccumulator::fold(&events);
-        assert_eq!(completion.text, "partial");
+        assert_eq!(completion.text_content(), "partial");
         assert_eq!(
             completion.finish_reason,
             FinishReason::Other(String::new())

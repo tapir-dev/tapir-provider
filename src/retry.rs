@@ -17,9 +17,9 @@
 //! decorator runtime-agnostic.
 
 use crate::error::{Error, ErrorKind};
+use crate::message::AssistantMessage;
 use crate::provider::Provider;
-use crate::request::CompletionRequest;
-use crate::response::CompletionResponse;
+use crate::request::{CompletionOptions, Context};
 use crate::stream::{StreamEvent, StreamEvents};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -27,7 +27,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 /// The waiting seam a [`RetryProvider`] backs off against.
@@ -94,7 +94,10 @@ impl ThreadTimer {
 impl Future for ThreadTimer {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<()> {
         if self.shared.fired.load(Ordering::Acquire) {
             return Poll::Ready(());
         }
@@ -313,9 +316,10 @@ impl<P: Provider> RetryProvider<P> {
     /// retry can happen.
     async fn establish_stream(
         &self,
-        request: CompletionRequest,
+        ctx: &Context,
+        opts: &CompletionOptions,
     ) -> Result<StreamEvents, Error> {
-        let mut stream = self.inner.complete_stream(request).await?;
+        let mut stream = self.inner.complete_stream(ctx, opts).await?;
         match stream.next().await {
             Some(Ok(event)) => {
                 let head =
@@ -336,11 +340,12 @@ impl<P: Provider> RetryProvider<P> {
 impl<P: Provider> Provider for RetryProvider<P> {
     async fn complete(
         &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, Error> {
+        ctx: &Context,
+        opts: &CompletionOptions,
+    ) -> Result<AssistantMessage, Error> {
         let mut retry = 0;
         loop {
-            match self.inner.complete(request.clone()).await {
+            match self.inner.complete(ctx, opts).await {
                 Ok(response) => return Ok(response),
                 Err(error) => self.after_failure(error, &mut retry).await?,
             }
@@ -349,11 +354,12 @@ impl<P: Provider> Provider for RetryProvider<P> {
 
     async fn complete_stream(
         &self,
-        request: CompletionRequest,
+        ctx: &Context,
+        opts: &CompletionOptions,
     ) -> Result<StreamEvents, Error> {
         let mut retry = 0;
         loop {
-            match self.establish_stream(request.clone()).await {
+            match self.establish_stream(ctx, opts).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => self.after_failure(error, &mut retry).await?,
             }
@@ -421,14 +427,14 @@ mod tests {
     /// test drives the retry loop deterministically.
     #[derive(Default)]
     struct SequencedProvider {
-        completions: Mutex<VecDeque<Result<CompletionResponse, Error>>>,
+        completions: Mutex<VecDeque<Result<AssistantMessage, Error>>>,
         streams: Mutex<VecDeque<StreamOutcome>>,
         calls: AtomicUsize,
     }
 
     impl SequencedProvider {
         fn with_completions(
-            outcomes: Vec<Result<CompletionResponse, Error>>,
+            outcomes: Vec<Result<AssistantMessage, Error>>,
         ) -> Self {
             Self {
                 completions: Mutex::new(outcomes.into()),
@@ -452,8 +458,9 @@ mod tests {
     impl Provider for SequencedProvider {
         async fn complete(
             &self,
-            _request: CompletionRequest,
-        ) -> Result<CompletionResponse, Error> {
+            _ctx: &Context,
+            _opts: &CompletionOptions,
+        ) -> Result<AssistantMessage, Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.completions
                 .lock()
@@ -464,7 +471,8 @@ mod tests {
 
         async fn complete_stream(
             &self,
-            _request: CompletionRequest,
+            _ctx: &Context,
+            _opts: &CompletionOptions,
         ) -> Result<StreamEvents, Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self
@@ -482,18 +490,18 @@ mod tests {
         }
     }
 
-    fn ok_response(text: &str) -> CompletionResponse {
-        CompletionResponse {
-            text: text.to_owned(),
-            tool_calls: Vec::new(),
-            usage: Usage::default(),
-            finish_reason: FinishReason::Stop,
-            raw: serde_json::Value::Null,
-        }
+    fn ok_response(text: &str) -> AssistantMessage {
+        AssistantMessage::text(text)
     }
 
-    fn request() -> CompletionRequest {
-        CompletionRequest::new(vec![Message::user("hi")])
+    /// The context every test drives the retry loop with.
+    fn ctx() -> Context {
+        Context::new(vec![Message::user("hi")])
+    }
+
+    /// The options every test drives the retry loop with.
+    fn opts() -> CompletionOptions {
+        CompletionOptions::default()
     }
 
     #[tokio::test]
@@ -510,9 +518,9 @@ mod tests {
             clock.clone(),
         );
 
-        let response = retry.complete(request()).await.unwrap();
+        let response = retry.complete(&ctx(), &opts()).await.unwrap();
 
-        assert_eq!(response.text, "done");
+        assert_eq!(response.text_content(), "done");
         // Three calls: the two failures and the success.
         assert_eq!(inner.calls(), 3);
         // Backoff doubled between the two retries: 10ms then 20ms.
@@ -536,7 +544,7 @@ mod tests {
             clock.clone(),
         );
 
-        retry.complete(request()).await.unwrap();
+        retry.complete(&ctx(), &opts()).await.unwrap();
 
         // The server's 750ms wins over the 10ms backoff.
         assert_eq!(clock.waits(), vec![Duration::from_millis(750)]);
@@ -557,7 +565,7 @@ mod tests {
             clock.clone(),
         );
 
-        let error = retry.complete(request()).await.unwrap_err();
+        let error = retry.complete(&ctx(), &opts()).await.unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::RateLimited);
         // Failed fast: the first attempt only, and no wait.
@@ -580,7 +588,7 @@ mod tests {
             clock.clone(),
         );
 
-        let error = retry.complete(request()).await.unwrap_err();
+        let error = retry.complete(&ctx(), &opts()).await.unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::ServerError);
         // One initial attempt plus two retries.
@@ -601,7 +609,7 @@ mod tests {
             clock.clone(),
         );
 
-        let error = retry.complete(request()).await.unwrap_err();
+        let error = retry.complete(&ctx(), &opts()).await.unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidRequest);
         assert_eq!(inner.calls(), 1);
@@ -621,7 +629,8 @@ mod tests {
             clock.clone(),
         );
 
-        assert_eq!(retry.complete(request()).await.unwrap().text, "done");
+        let response = retry.complete(&ctx(), &opts()).await.unwrap();
+        assert_eq!(response.text_content(), "done");
         assert_eq!(inner.calls(), 2);
     }
 
@@ -637,7 +646,8 @@ mod tests {
             Arc::new(BlockingClock),
         );
 
-        let fut = retry.complete(request());
+        let (ctx, opts) = (ctx(), opts());
+        let fut = retry.complete(&ctx, &opts);
         tokio::pin!(fut);
         // The first attempt fails and the call parks in the (forever) wait;
         // racing it against an immediately-ready future drops it mid-wait.
@@ -672,7 +682,7 @@ mod tests {
         );
 
         let events: Vec<_> = retry
-            .complete_stream(request())
+            .complete_stream(&ctx(), &opts())
             .await
             .unwrap()
             .map(Result::unwrap)
@@ -706,7 +716,7 @@ mod tests {
         );
 
         let events: Vec<_> = retry
-            .complete_stream(request())
+            .complete_stream(&ctx(), &opts())
             .await
             .unwrap()
             .map(Result::unwrap)
@@ -736,7 +746,7 @@ mod tests {
         );
 
         let items: Vec<_> = retry
-            .complete_stream(request())
+            .complete_stream(&ctx(), &opts())
             .await
             .unwrap()
             .collect()

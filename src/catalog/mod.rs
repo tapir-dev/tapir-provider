@@ -496,7 +496,7 @@ mod openai_build_tests {
     use super::*;
     use crate::http::MockHttpClient;
     use crate::message::Message;
-    use crate::request::CompletionRequest;
+    use crate::request::{CompletionOptions, Context};
     use crate::token_store::InMemoryTokenStore;
 
     const SAMPLE_RESPONSE: &str = r#"{
@@ -523,10 +523,13 @@ mod openai_build_tests {
             .unwrap();
 
         let response = provider
-            .complete(CompletionRequest::new(vec![Message::user("hello")]))
+            .complete(
+                &Context::new(vec![Message::user("hello")]),
+                &CompletionOptions::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(response.text, "hi");
+        assert_eq!(response.text_content(), "hi");
         // The resolved key reached the wire on the Bearer lane, and the entry's
         // base URL drove the request.
         let sent = http.last_request();

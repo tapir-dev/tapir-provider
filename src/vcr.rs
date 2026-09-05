@@ -847,7 +847,7 @@ mod anthropic_tests {
     use crate::provider::Provider;
     use crate::providers::AnthropicProvider;
     use crate::providers::anthropic::oauth::AnthropicOAuth;
-    use crate::request::CompletionRequest;
+    use crate::request::{CompletionOptions, Context};
     use crate::stream::{StreamAccumulator, StreamEvent};
     use futures_util::StreamExt;
     use std::sync::Arc;
@@ -879,7 +879,10 @@ mod anthropic_tests {
                 .build()
                 .unwrap();
         let mut stream = provider
-            .complete_stream(CompletionRequest::new(vec![Message::user("hi")]))
+            .complete_stream(
+                &Context::new(vec![Message::user("hi")]),
+                &CompletionOptions::default(),
+            )
             .await
             .unwrap();
         while stream.next().await.is_some() {}
@@ -894,7 +897,10 @@ mod anthropic_tests {
             .build()
             .unwrap();
         let mut stream = provider
-            .complete_stream(CompletionRequest::new(vec![Message::user("hi")]))
+            .complete_stream(
+                &Context::new(vec![Message::user("hi")]),
+                &CompletionOptions::default(),
+            )
             .await
             .unwrap();
         let mut accumulator = StreamAccumulator::new();
@@ -908,7 +914,7 @@ mod anthropic_tests {
         }
         assert!(saw_done, "the replayed stream ended in a Done event");
         let completion = accumulator.finish();
-        assert_eq!(completion.text, "Hi");
+        assert_eq!(completion.text_content(), "Hi");
     }
 
     /// Record one OAuth token exchange against a fake upstream, so a replay can

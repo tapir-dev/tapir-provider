@@ -61,7 +61,32 @@ fetched layer. Distinct from the Registry, which is the compile-time set of Prov
 _Avoid_: Catalog manager, model store.
 
 **Tool Call**:
-A request from the model to invoke a named tool with JSON arguments. It carries two
-ids: an SDK-minted id that is always present, so callers have a stable handle, and an
-optional provider-native id kept when the wire protocol supplies one.
+A request from the model to invoke a named tool with JSON arguments, carried as a
+content part of an Assistant Message. It carries a single id that is always present,
+so callers have a stable handle to correlate a Tool Result back to it: the
+provider-native id when the wire protocol supplies one, else an SDK-minted id.
 _Avoid_: Function call, invocation.
+
+**Tool Result**:
+The outcome of running a Tool Call, sent back to the model as its own Message. It
+references the Tool Call by id, names the tool, carries the result as content, and
+flags whether the run errored.
+_Avoid_: Tool output, tool response, function result.
+
+**Context**:
+The full conversational input to a Provider: an optional system prompt, the ordered
+Messages so far, and the Tools the model may call. An Assistant Message returned by a
+Provider drops straight back into it for the next turn. Distinct from Completion
+Options, which carry the request's sampling knobs.
+_Avoid_: Conversation, session, prompt, request.
+
+**Completion Options**:
+The per-request knobs that steer generation rather than describe the conversation:
+sampling temperature, output-token cap, and tool choice. Passed alongside the Context.
+_Avoid_: Config, settings, params.
+
+**Assistant Message**:
+A reply produced by the model: its content parts (text and Tool Calls), token usage,
+and finish reason. It is both what a Provider returns and a Message in the Context,
+so a completion is appended to the conversation without conversion.
+_Avoid_: Completion, response, reply.

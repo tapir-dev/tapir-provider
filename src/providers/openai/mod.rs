@@ -11,12 +11,12 @@ pub use embedding::OpenAIEmbeddingProvider;
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
 use crate::http::{ByteStream, HttpClient, HttpRequest, Method};
-use crate::message::{ContentPart, ImageSource, Role};
-use crate::provider::Provider;
-use crate::request::{CompletionRequest, ToolChoice, ToolDefinition};
-use crate::response::{
-    CompletionResponse, FinishReason, ToolCall, Usage, mint_call_id,
+use crate::message::{
+    AssistantMessage, ContentPart, ImageSource, Message, ToolResultMessage,
 };
+use crate::provider::Provider;
+use crate::request::{CompletionOptions, Context, ToolChoice, ToolDefinition};
+use crate::response::{FinishReason, Usage};
 use crate::sse::{SseDecoder, SseEvent};
 use crate::stream::{StreamEvent, StreamEvents};
 use crate::token_store::{TokenStore, resolve};
@@ -26,7 +26,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 
 /// Default base URL for the OpenAI API.
 pub(super) const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -211,12 +211,14 @@ impl<H: HttpClient> OpenAIProvider<H> {
 
     fn build_http_request(
         &self,
-        request: &CompletionRequest,
+        ctx: &Context,
+        opts: &CompletionOptions,
         streaming: Streaming,
     ) -> Result<HttpRequest, Error> {
-        let body = serde_json::to_vec(&WireRequest::from_request(
+        let body = serde_json::to_vec(&WireRequest::from_context(
             &self.model,
-            request,
+            ctx,
+            opts,
             streaming,
         ))
         .map_err(Error::serialize)?;
@@ -328,9 +330,11 @@ impl<H: HttpClient> OpenAIBuilder<H> {
 impl<H: HttpClient> Provider for OpenAIProvider<H> {
     async fn complete(
         &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, Error> {
-        let http_request = self.build_http_request(&request, Streaming::Off)?;
+        ctx: &Context,
+        opts: &CompletionOptions,
+    ) -> Result<AssistantMessage, Error> {
+        let http_request =
+            self.build_http_request(ctx, opts, Streaming::Off)?;
         let response = self.http.send(http_request).await?;
 
         if !response.is_success() {
@@ -342,14 +346,15 @@ impl<H: HttpClient> Provider for OpenAIProvider<H> {
         let raw: serde_json::Value =
             serde_json::from_slice(&response.body).map_err(Error::decode)?;
 
-        Ok(wire.into_response(raw))
+        Ok(wire.into_message(raw))
     }
 
     async fn complete_stream(
         &self,
-        request: CompletionRequest,
+        ctx: &Context,
+        opts: &CompletionOptions,
     ) -> Result<StreamEvents, Error> {
-        let http_request = self.build_http_request(&request, Streaming::On)?;
+        let http_request = self.build_http_request(ctx, opts, Streaming::On)?;
         let bytes = self.http.send_stream(http_request).await?;
         Ok(Box::pin(SseEventStream::new(bytes)))
     }
@@ -391,7 +396,7 @@ impl futures_core::Stream for SseEventStream {
 
     fn poll_next(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
@@ -589,29 +594,29 @@ struct WireStreamOptions {
 }
 
 impl<'a> WireRequest<'a> {
-    fn from_request(
+    fn from_context(
         model: &'a str,
-        request: &'a CompletionRequest,
+        ctx: &'a Context,
+        opts: &'a CompletionOptions,
         streaming: Streaming,
     ) -> Self {
-        let messages = request
-            .messages
-            .iter()
-            .map(|message| WireMessage {
-                role: wire_role(message.role),
-                content: wire_content(&message.content),
-            })
-            .collect();
+        // The system prompt rides as a leading `system` message; the rest of
+        // the conversation follows in order.
+        let mut messages = Vec::with_capacity(ctx.messages.len() + 1);
+        if let Some(system) = &ctx.system_prompt {
+            messages.push(WireMessage::system(system));
+        }
+        messages.extend(ctx.messages.iter().map(wire_message));
 
-        let tools = request.tools.iter().map(WireTool::from_tool).collect();
+        let tools = ctx.tools.iter().map(WireTool::from_tool).collect();
 
         Self {
             model,
             messages,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
+            temperature: opts.temperature,
+            max_tokens: opts.max_tokens,
             tools,
-            tool_choice: request.tool_choice.as_ref().map(wire_tool_choice),
+            tool_choice: opts.tool_choice.as_ref().map(wire_tool_choice),
             stream: streaming.enabled(),
             stream_options: streaming.enabled().then_some(WireStreamOptions {
                 include_usage: true,
@@ -620,12 +625,67 @@ impl<'a> WireRequest<'a> {
     }
 }
 
-/// The OpenAI role string for a neutral [`Role`].
-const fn wire_role(role: Role) -> &'static str {
-    match role {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
+/// Map one neutral [`Message`] onto an OpenAI request message.
+fn wire_message(message: &Message) -> WireMessage<'_> {
+    match message {
+        Message::User { content } => WireMessage {
+            role: "user",
+            content: Some(wire_content(content)),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        },
+        Message::Assistant(assistant) => wire_assistant(assistant),
+        Message::ToolResult(result) => wire_tool_result(result),
+    }
+}
+
+/// Map an [`AssistantMessage`] onto an OpenAI `assistant` message, splitting its
+/// content into text and a `tool_calls` array. Content is omitted (sent `null`)
+/// when the reply is only tool calls, as OpenAI expects.
+fn wire_assistant(assistant: &AssistantMessage) -> WireMessage<'_> {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for part in &assistant.content {
+        match part {
+            ContentPart::Text(chunk) => text.push_str(chunk),
+            ContentPart::ToolCall {
+                id,
+                name,
+                arguments,
+            } => tool_calls.push(WireToolCall {
+                id,
+                call_type: "function",
+                function: WireToolCallFunction {
+                    name,
+                    arguments: arguments.to_string(),
+                },
+            }),
+            // An assistant image is not representable on the request; skip it.
+            ContentPart::Image(_) => {}
+        }
+    }
+    let content = if text.is_empty() && !tool_calls.is_empty() {
+        None
+    } else {
+        Some(WireContent::Text(Cow::Owned(text)))
+    };
+    WireMessage {
+        role: "assistant",
+        content,
+        tool_calls,
+        tool_call_id: None,
+    }
+}
+
+/// Map a [`ToolResultMessage`] onto an OpenAI `tool` message, referencing the
+/// call by id. OpenAI has no error flag on a tool message, so
+/// [`is_error`](ToolResultMessage::is_error) is not carried on the wire.
+fn wire_tool_result(result: &ToolResultMessage) -> WireMessage<'_> {
+    WireMessage {
+        role: "tool",
+        content: Some(wire_content(&result.content)),
+        tool_calls: Vec::new(),
+        tool_call_id: Some(&result.tool_call_id),
     }
 }
 
@@ -672,10 +732,49 @@ impl<'a> WireTool<'a> {
 }
 
 /// A single message in the OpenAI request body.
+///
+/// The optional fields cover the several message shapes: a `tool` message
+/// carries a [`tool_call_id`](Self::tool_call_id), an `assistant` message may
+/// carry [`tool_calls`](Self::tool_calls) with `null` content, and every other
+/// message carries [`content`](Self::content).
 #[derive(Debug, Serialize)]
 struct WireMessage<'a> {
     role: &'a str,
-    content: WireContent<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<WireContent<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<WireToolCall<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+}
+
+impl<'a> WireMessage<'a> {
+    /// A `system` message carrying the given prompt.
+    fn system(prompt: &'a str) -> Self {
+        Self {
+            role: "system",
+            content: Some(WireContent::Text(Cow::Borrowed(prompt))),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+}
+
+/// A tool call in an OpenAI `assistant` message.
+#[derive(Debug, Serialize)]
+struct WireToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    call_type: &'static str,
+    function: WireToolCallFunction<'a>,
+}
+
+/// The `function` object of an OpenAI assistant tool call; `arguments` is a
+/// JSON string, as the API expects.
+#[derive(Debug, Serialize)]
+struct WireToolCallFunction<'a> {
+    name: &'a str,
+    arguments: String,
 }
 
 /// A message's content on the wire.
@@ -686,7 +785,7 @@ struct WireMessage<'a> {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum WireContent<'a> {
-    Text(&'a str),
+    Text(Cow<'a, str>),
     Parts(Vec<WireContentPart<'a>>),
 }
 
@@ -706,22 +805,27 @@ struct WireImageUrl<'a> {
 }
 
 /// Map neutral content parts onto OpenAI's message content.
+///
+/// A tool-call part never appears in the content of a user or tool message, so
+/// it is dropped here; assistant tool calls travel in the `tool_calls` array.
 fn wire_content(parts: &[ContentPart]) -> WireContent<'_> {
     if let [ContentPart::Text(text)] = parts {
-        return WireContent::Text(text.as_str());
+        return WireContent::Text(Cow::Borrowed(text.as_str()));
     }
-    WireContent::Parts(parts.iter().map(wire_content_part).collect())
+    WireContent::Parts(parts.iter().filter_map(wire_content_part).collect())
 }
 
-/// Map one neutral content part onto an OpenAI content part.
-fn wire_content_part(part: &ContentPart) -> WireContentPart<'_> {
+/// Map one neutral content part onto an OpenAI content part, or `None` for a
+/// part with no request-content representation.
+fn wire_content_part(part: &ContentPart) -> Option<WireContentPart<'_>> {
     match part {
-        ContentPart::Text(text) => WireContentPart::Text { text },
-        ContentPart::Image(source) => WireContentPart::ImageUrl {
+        ContentPart::Text(text) => Some(WireContentPart::Text { text }),
+        ContentPart::Image(source) => Some(WireContentPart::ImageUrl {
             image_url: WireImageUrl {
                 url: wire_image_url(source),
             },
-        },
+        }),
+        ContentPart::ToolCall { .. } => None,
     }
 }
 
@@ -751,7 +855,7 @@ struct WireResponse {
 }
 
 impl WireResponse {
-    fn into_response(self, raw: serde_json::Value) -> CompletionResponse {
+    fn into_message(self, raw: serde_json::Value) -> AssistantMessage {
         let usage = Usage {
             input_tokens: self.usage.prompt_tokens,
             output_tokens: self.usage.completion_tokens,
@@ -759,33 +863,34 @@ impl WireResponse {
         // Chat Completions returns a single choice for the default `n`; take the
         // first and leave the rest to the raw escape hatch.
         let Some(choice) = self.choices.into_iter().next() else {
-            return CompletionResponse {
-                text: String::new(),
-                tool_calls: Vec::new(),
+            return AssistantMessage {
+                content: Vec::new(),
                 usage,
                 finish_reason: FinishReason::Other(String::new()),
-                raw,
+                raw: Some(raw),
             };
         };
 
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .into_iter()
-            .map(|call| ToolCall {
-                id: mint_call_id(),
-                native_id: Some(call.id),
+        // Text leads, then tool calls, mirroring how the reply reads back.
+        let mut content = Vec::new();
+        if let Some(text) = choice.message.content
+            && !text.is_empty()
+        {
+            content.push(ContentPart::Text(text));
+        }
+        for call in choice.message.tool_calls {
+            content.push(ContentPart::ToolCall {
+                id: call.id,
                 name: call.function.name,
                 arguments: parse_arguments(&call.function.arguments),
-            })
-            .collect();
+            });
+        }
 
-        CompletionResponse {
-            text: choice.message.content.unwrap_or_default(),
-            tool_calls,
+        AssistantMessage {
+            content,
             usage,
             finish_reason: map_finish_reason(choice.finish_reason.as_deref()),
-            raw,
+            raw: Some(raw),
         }
     }
 }
@@ -874,8 +979,34 @@ mod tests {
         "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
     }"#;
 
-    /// Send one request and return its parsed JSON body.
-    async fn sent_body(request: CompletionRequest) -> serde_json::Value {
+    /// The default, empty per-request options.
+    fn opts() -> CompletionOptions {
+        CompletionOptions::default()
+    }
+
+    /// The tool calls in a reply, as `(id, name, arguments)` tuples in order.
+    fn tool_calls(
+        message: &AssistantMessage,
+    ) -> Vec<(&str, &str, &serde_json::Value)> {
+        message
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some((id.as_str(), name.as_str(), arguments)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Send one context/options pair and return its parsed JSON body.
+    async fn sent_body(
+        ctx: Context,
+        opts: CompletionOptions,
+    ) -> serde_json::Value {
         let mock =
             Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
         let provider = OpenAIProvider::new(
@@ -883,7 +1014,7 @@ mod tests {
             Credential::api_key("sk-test"),
             "gpt-4o-mini",
         );
-        provider.complete(request).await.unwrap();
+        provider.complete(&ctx, &opts).await.unwrap();
         serde_json::from_slice(mock.last_request().body.as_deref().unwrap())
             .unwrap()
     }
@@ -891,9 +1022,9 @@ mod tests {
     async fn collect_stream(
         provider: &OpenAIProvider<Arc<MockHttpClient>>,
     ) -> Vec<StreamEvent> {
-        let request = CompletionRequest::new(vec![Message::user("hi")]);
+        let ctx = Context::new(vec![Message::user("hi")]);
         provider
-            .complete_stream(request)
+            .complete_stream(&ctx, &opts())
             .await
             .unwrap()
             .map(Result::unwrap)
@@ -911,14 +1042,14 @@ mod tests {
             "gpt-4o-mini",
         );
 
-        let request = CompletionRequest::new(vec![Message::user("Hello")]);
-        let response = provider.complete(request).await.unwrap();
+        let ctx = Context::new(vec![Message::user("Hello")]);
+        let response = provider.complete(&ctx, &opts()).await.unwrap();
 
-        assert_eq!(response.text, "Hello there!");
+        assert_eq!(response.text_content(), "Hello there!");
         assert_eq!(response.usage.input_tokens, 12);
         assert_eq!(response.usage.output_tokens, 5);
         assert_eq!(response.finish_reason, FinishReason::Stop);
-        assert_eq!(response.raw["id"], "chatcmpl-123");
+        assert_eq!(response.raw.as_ref().unwrap()["id"], "chatcmpl-123");
     }
 
     #[tokio::test]
@@ -939,12 +1070,10 @@ mod tests {
         )
         .unwrap();
 
-        let response = provider
-            .complete(CompletionRequest::new(vec![Message::user("Hello")]))
-            .await
-            .unwrap();
+        let ctx = Context::new(vec![Message::user("Hello")]);
+        let response = provider.complete(&ctx, &opts()).await.unwrap();
 
-        assert_eq!(response.text, "Hello there!");
+        assert_eq!(response.text_content(), "Hello there!");
         assert!(
             mock.last_request()
                 .headers
@@ -963,13 +1092,10 @@ mod tests {
             "gpt-4o-mini",
         );
 
-        let request = CompletionRequest::new(vec![
-            Message::system("Be terse."),
-            Message::user("Hi"),
-        ])
-        .with_temperature(0.2)
-        .with_max_tokens(64);
-        provider.complete(request).await.unwrap();
+        let ctx =
+            Context::new(vec![Message::user("Hi")]).with_system("Be terse.");
+        let opts = opts().with_temperature(0.2).with_max_tokens(64);
+        provider.complete(&ctx, &opts).await.unwrap();
 
         let sent = mock.last_request();
         assert_eq!(sent.method, Method::Post);
@@ -985,7 +1111,7 @@ mod tests {
         assert_eq!(body["model"], "gpt-4o-mini");
         assert_eq!(body["max_tokens"], 64);
         assert_eq!(body["temperature"], 0.2);
-        // System is a plain message, not a separate field.
+        // The system prompt leads as a plain `system` message.
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "Be terse.");
         assert_eq!(body["messages"][1]["role"], "user");
@@ -1002,14 +1128,17 @@ mod tests {
             "properties": {"city": {"type": "string"}},
             "required": ["city"],
         });
-        let request = CompletionRequest::new(vec![Message::user("weather?")])
-            .with_tools(vec![ToolDefinition::new(
-                "get_weather",
-                "Look up the weather for a city",
-                schema.clone(),
-            )])
-            .with_tool_choice(ToolChoice::Tool("get_weather".to_owned()));
-        let body = sent_body(request).await;
+        let ctx =
+            Context::new(vec![Message::user("weather?")]).with_tools(vec![
+                ToolDefinition::new(
+                    "get_weather",
+                    "Look up the weather for a city",
+                    schema.clone(),
+                ),
+            ]);
+        let opts =
+            opts().with_tool_choice(ToolChoice::Tool("get_weather".to_owned()));
+        let body = sent_body(ctx, opts).await;
 
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
@@ -1029,9 +1158,8 @@ mod tests {
             (ToolChoice::Any, serde_json::json!("required")),
             (ToolChoice::None, serde_json::json!("none")),
         ] {
-            let request = CompletionRequest::new(vec![Message::user("hi")])
-                .with_tool_choice(choice);
-            let body = sent_body(request).await;
+            let ctx = Context::new(vec![Message::user("hi")]);
+            let body = sent_body(ctx, opts().with_tool_choice(choice)).await;
             assert_eq!(body["tool_choice"], expected);
         }
     }
@@ -1039,13 +1167,55 @@ mod tests {
     #[tokio::test]
     async fn omits_tools_and_choice_when_unset() {
         let body =
-            sent_body(CompletionRequest::new(vec![Message::user("hi")])).await;
+            sent_body(Context::new(vec![Message::user("hi")]), opts()).await;
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
     }
 
     #[tokio::test]
-    async fn tool_call_response_normalizes_with_both_ids() {
+    async fn assistant_tool_call_and_tool_result_round_trip_onto_the_wire() {
+        // A full tool turn appended back into the context: the assistant's tool
+        // call, then the result answering it.
+        let ctx = Context::new(vec![
+            Message::user("weather?"),
+            Message::Assistant(AssistantMessage {
+                content: vec![ContentPart::tool_call(
+                    "call_7",
+                    "get_weather",
+                    serde_json::json!({"city": "Paris"}),
+                )],
+                usage: Usage::default(),
+                finish_reason: FinishReason::ToolUse,
+                raw: None,
+            }),
+            Message::tool_result("call_7", "get_weather", "sunny"),
+        ]);
+        let body = sent_body(ctx, opts()).await;
+
+        // The assistant message carries the call in `tool_calls`, content null.
+        let assistant = &body["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        assert!(assistant["content"].is_null());
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_7");
+        assert_eq!(assistant["tool_calls"][0]["type"], "function");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        // Arguments ride as a JSON string.
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+        // The result is a `tool` message referencing the call by id.
+        let result = &body["messages"][2];
+        assert_eq!(result["role"], "tool");
+        assert_eq!(result["tool_call_id"], "call_7");
+        assert_eq!(result["content"], "sunny");
+    }
+
+    #[tokio::test]
+    async fn tool_call_response_normalizes_to_a_content_part() {
         let response = r#"{
             "id": "chatcmpl-tool",
             "choices": [{
@@ -1070,19 +1240,18 @@ mod tests {
             "gpt-4o-mini",
         );
 
-        let completion = provider
-            .complete(CompletionRequest::new(vec![Message::user("weather?")]))
-            .await
-            .unwrap();
+        let ctx = Context::new(vec![Message::user("weather?")]);
+        let completion = provider.complete(&ctx, &opts()).await.unwrap();
 
-        assert_eq!(completion.text, "");
+        assert_eq!(completion.text_content(), "");
         assert_eq!(completion.finish_reason, FinishReason::ToolUse);
-        assert_eq!(completion.tool_calls.len(), 1);
-        let call = &completion.tool_calls[0];
-        assert_eq!(call.native_id.as_deref(), Some("call_42"));
-        assert!(!call.id.is_empty());
-        assert_eq!(call.name, "get_weather");
-        assert_eq!(call.arguments, serde_json::json!({"city": "Paris"}));
+        let calls = tool_calls(&completion);
+        assert_eq!(calls.len(), 1);
+        let (id, name, arguments) = calls[0];
+        // The native call id becomes the part's stable handle.
+        assert_eq!(id, "call_42");
+        assert_eq!(name, "get_weather");
+        assert_eq!(arguments, &serde_json::json!({"city": "Paris"}));
     }
 
     #[tokio::test]
@@ -1097,10 +1266,8 @@ mod tests {
             "gpt-4o-mini",
         );
 
-        let err = provider
-            .complete(CompletionRequest::new(vec![Message::user("hi")]))
-            .await
-            .unwrap_err();
+        let ctx = Context::new(vec![Message::user("hi")]);
+        let err = provider.complete(&ctx, &opts()).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::Authentication);
         assert_eq!(err.status(), Some(401));
@@ -1117,10 +1284,8 @@ mod tests {
         let provider =
             OpenAIProvider::new(mock, Credential::api_key("k"), "gpt-4o-mini");
 
-        let err = provider
-            .complete(CompletionRequest::new(vec![Message::user("hi")]))
-            .await
-            .unwrap_err();
+        let ctx = Context::new(vec![Message::user("hi")]);
+        let err = provider.complete(&ctx, &opts()).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::RateLimited);
         assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
@@ -1128,11 +1293,11 @@ mod tests {
 
     #[tokio::test]
     async fn url_image_and_text_mix_within_one_user_message() {
-        let request = CompletionRequest::new(vec![
+        let ctx = Context::new(vec![
             Message::user("what is this?")
                 .with_image(ImageSource::url("https://example.com/cat.png")),
         ]);
-        let body = sent_body(request).await;
+        let body = sent_body(ctx, opts()).await;
 
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["type"], "text");
@@ -1146,14 +1311,11 @@ mod tests {
 
     #[tokio::test]
     async fn raw_bytes_image_becomes_a_base64_data_url() {
-        let request = CompletionRequest::new(vec![Message::from_parts(
-            Role::User,
-            vec![ContentPart::image(ImageSource::bytes(
-                MediaType::Png,
-                b"hi".to_vec(),
-            ))],
-        )]);
-        let body = sent_body(request).await;
+        let ctx =
+            Context::new(vec![Message::user_parts(vec![ContentPart::image(
+                ImageSource::bytes(MediaType::Png, b"hi".to_vec()),
+            )])]);
+        let body = sent_body(ctx, opts()).await;
 
         // "hi" base64-encodes to "aGk=".
         assert_eq!(
@@ -1228,7 +1390,7 @@ mod tests {
         let events = collect_stream(&provider).await;
         let folded = StreamAccumulator::fold(&events);
 
-        assert_eq!(folded.text, "Hello, world");
+        assert_eq!(folded.text_content(), "Hello, world");
         assert_eq!(folded.finish_reason, FinishReason::Stop);
         assert_eq!(folded.usage.input_tokens, 7);
         assert_eq!(folded.usage.output_tokens, 5);
@@ -1285,11 +1447,12 @@ mod tests {
 
         let folded = StreamAccumulator::fold(&events);
         assert_eq!(folded.finish_reason, FinishReason::ToolUse);
-        assert_eq!(folded.tool_calls.len(), 1);
-        let call = &folded.tool_calls[0];
-        assert_eq!(call.native_id.as_deref(), Some("call_9"));
-        assert_eq!(call.name, "get_weather");
-        assert_eq!(call.arguments, serde_json::json!({"city": "Paris"}));
+        let calls = tool_calls(&folded);
+        assert_eq!(calls.len(), 1);
+        let (id, name, arguments) = calls[0];
+        assert_eq!(id, "call_9");
+        assert_eq!(name, "get_weather");
+        assert_eq!(arguments, &serde_json::json!({"city": "Paris"}));
     }
 
     #[tokio::test]
@@ -1327,7 +1490,8 @@ mod tests {
 
         let http = provider
             .build_http_request(
-                &CompletionRequest::new(vec![Message::user("hi")]),
+                &Context::new(vec![Message::user("hi")]),
+                &opts(),
                 Streaming::Off,
             )
             .unwrap();

@@ -21,8 +21,8 @@
 //! # {
 //! use std::sync::Arc;
 //! use tapir_provider::{
-//!     AnthropicProvider, Credential, CompletionRequest, Message, Provider,
-//!     http::MockHttpClient,
+//!     AnthropicProvider, CompletionOptions, Context, Credential, Message,
+//!     Provider, http::MockHttpClient,
 //! };
 //!
 //! let rt = tokio::runtime::Builder::new_current_thread()
@@ -37,9 +37,9 @@
 //!     let provider =
 //!         AnthropicProvider::new(http, Credential::api_key("sk-x"), "claude-3-5-sonnet");
 //!
-//!     let request = CompletionRequest::new(vec![Message::user("hello")]);
-//!     let response = provider.complete(request).await.unwrap();
-//!     assert_eq!(response.text, "hi");
+//!     let ctx = Context::new(vec![Message::user("hello")]);
+//!     let response = provider.complete(&ctx, &CompletionOptions::default()).await.unwrap();
+//!     assert_eq!(response.text_content(), "hi");
 //! });
 //! # }
 //! ```
@@ -81,7 +81,10 @@ pub use credential::{Credential, OAuthTokens};
 pub use embedding::{EmbeddingProvider, EmbeddingRequest, EmbeddingResponse};
 pub use error::{Error, ErrorKind};
 pub use http::{ByteStream, HttpClient, HttpRequest, HttpResponse, Method};
-pub use message::{ContentPart, ImageSource, MediaType, Message, Role};
+pub use message::{
+    AssistantMessage, ContentPart, ImageSource, MediaType, Message,
+    ToolResultMessage,
+};
 #[cfg(feature = "models")]
 pub use model::{
     Api, CompatConfig, Dialect, InputType, Model, ModelCost, ModelEntry,
@@ -90,8 +93,8 @@ pub use model::{
 pub use model::{ModelId, ProviderId};
 pub use provider::Provider;
 pub use registry::{ProviderInfo, Registry};
-pub use request::{CompletionRequest, ToolChoice, ToolDefinition};
-pub use response::{CompletionResponse, FinishReason, ToolCall, Usage};
+pub use request::{CompletionOptions, Context, ToolChoice, ToolDefinition};
+pub use response::{FinishReason, Usage};
 pub use retry::{Clock, RetryPolicy, RetryProvider, SystemClock};
 pub use sse::{SseDecoder, SseEvent};
 pub use stream::{StreamAccumulator, StreamEvent, StreamEvents};

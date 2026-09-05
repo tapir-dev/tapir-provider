@@ -43,6 +43,29 @@ pub struct Model {
     pub headers: Vec<(String, String)>,
 }
 
+impl Model {
+    /// The USD cost of a call that consumed the given token counts.
+    ///
+    /// Each count is priced at its matching [`ModelCost`] rate (quoted per
+    /// million tokens) and summed. A Model without prompt caching prices the
+    /// `cache_read`/`cache_write` counts at `0.0`.
+    #[must_use]
+    pub fn calculate_cost(
+        &self,
+        input: u32,
+        output: u32,
+        cache_read: u32,
+        cache_write: u32,
+    ) -> f64 {
+        let cost = &self.cost;
+        (cost.input * f64::from(input)
+            + cost.output * f64::from(output)
+            + cost.cache_read * f64::from(cache_read)
+            + cost.cache_write * f64::from(cache_write))
+            / 1_000_000.0
+    }
+}
+
 /// Per-token cost for a Model, in USD per million tokens.
 ///
 /// Flat by design: one rate per token class, so a caller multiplies a token
@@ -162,6 +185,16 @@ mod tests {
             max_tokens: 16_384,
             headers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn calculate_cost_sums_each_class_per_million() {
+        let model = sample_model();
+        // 1M input at 2.5 + 1M output at 10.0 + 1M cache_read at 1.25.
+        let cost = model.calculate_cost(1_000_000, 1_000_000, 1_000_000, 0);
+        assert!((cost - 13.75).abs() < 1e-9);
+        // A zero call costs nothing.
+        assert_eq!(model.calculate_cost(0, 0, 0, 0), 0.0);
     }
 
     #[test]

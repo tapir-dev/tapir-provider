@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: ISC
 // SPDX-FileCopyrightText: 2026 Murilo Ijanc' <murilo@ijanc.org>
 
-//! The normalized [`CompletionRequest`] sent to a Provider.
+//! The [`Context`] and [`CompletionOptions`] a Provider is called with.
+//!
+//! A [`Context`] is the conversational input — the system prompt, the messages
+//! so far, and the tools the model may call — and drops an
+//! [`AssistantMessage`](crate::message::AssistantMessage) straight back in for
+//! the next turn. [`CompletionOptions`] are the per-request sampling knobs that
+//! steer generation rather than describe the conversation. A Provider takes both
+//! by reference, so the same options can drive several turns over one context.
 
 use crate::message::Message;
 
@@ -49,28 +56,27 @@ pub enum ToolChoice {
     None,
 }
 
-/// A normalized request for a single, non-streaming text completion.
+/// The full conversational input to a Provider.
 ///
-/// The addressable Model is chosen when the Provider is built, so it is not
-/// part of the request.
+/// It bundles an optional system prompt, the ordered [`Message`]s so far, and
+/// the [`ToolDefinition`]s the model may call. An
+/// [`AssistantMessage`](crate::message::AssistantMessage) a Provider returns is
+/// itself a [`Message`], so it appends straight back into
+/// [`messages`](Self::messages) for the next turn. The addressable Model is
+/// chosen when the Provider is built, so it is not part of the context.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct CompletionRequest {
+pub struct Context {
+    /// Instructions that steer the model, sent out of band from the messages.
+    pub system_prompt: Option<String>,
     /// The conversation so far, in order.
     pub messages: Vec<Message>,
-    /// Sampling temperature; `None` leaves the Provider default.
-    pub temperature: Option<f32>,
-    /// Upper bound on tokens to generate; `None` leaves the Provider default.
-    pub max_tokens: Option<u32>,
     /// Tools the model may call; empty leaves tool calling off.
     pub tools: Vec<ToolDefinition>,
-    /// How the model is steered toward calling a tool; `None` leaves the
-    /// Provider default (typically automatic when `tools` is non-empty).
-    pub tool_choice: Option<ToolChoice>,
 }
 
-impl CompletionRequest {
-    /// Construct a request from a list of messages, leaving sampling knobs at
-    /// their Provider defaults.
+impl Context {
+    /// Construct a context from a list of messages, with no system prompt and no
+    /// tools.
     pub fn new(messages: impl Into<Vec<Message>>) -> Self {
         Self {
             messages: messages.into(),
@@ -78,6 +84,43 @@ impl CompletionRequest {
         }
     }
 
+    /// Set the system prompt.
+    #[must_use]
+    pub fn with_system(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(system_prompt.into());
+        self
+    }
+
+    /// Offer the model a set of tools it may call.
+    #[must_use]
+    pub fn with_tools(mut self, tools: impl Into<Vec<ToolDefinition>>) -> Self {
+        self.tools = tools.into();
+        self
+    }
+
+    /// Append a message to the conversation.
+    pub fn push(&mut self, message: Message) {
+        self.messages.push(message);
+    }
+}
+
+/// The per-request knobs that steer generation.
+///
+/// These describe how to sample, not what the conversation is: the sampling
+/// temperature, the output-token cap, and the tool choice. Passed alongside a
+/// [`Context`], so one set of options can drive several turns.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CompletionOptions {
+    /// Sampling temperature; `None` leaves the Provider default.
+    pub temperature: Option<f32>,
+    /// Upper bound on tokens to generate; `None` leaves the Provider default.
+    pub max_tokens: Option<u32>,
+    /// How the model is steered toward calling a tool; `None` leaves the
+    /// Provider default (typically automatic when tools are offered).
+    pub tool_choice: Option<ToolChoice>,
+}
+
+impl CompletionOptions {
     /// Set the sampling temperature.
     #[must_use]
     pub fn with_temperature(mut self, temperature: f32) -> Self {
@@ -89,13 +132,6 @@ impl CompletionRequest {
     #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
-        self
-    }
-
-    /// Offer the model a set of tools it may call.
-    #[must_use]
-    pub fn with_tools(mut self, tools: impl Into<Vec<ToolDefinition>>) -> Self {
-        self.tools = tools.into();
         self
     }
 
@@ -112,36 +148,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builders_set_the_optional_knobs() {
-        let req = CompletionRequest::new(vec![Message::user("hi")])
-            .with_temperature(0.5)
-            .with_max_tokens(256);
-        assert_eq!(req.temperature, Some(0.5));
-        assert_eq!(req.max_tokens, Some(256));
-        assert_eq!(req.messages.len(), 1);
-    }
-
-    #[test]
-    fn builders_attach_tools_and_a_choice() {
+    fn context_builders_set_the_system_prompt_and_tools() {
         let tool = ToolDefinition::new(
             "get_weather",
             "Look up the weather",
             serde_json::json!({"type": "object"}),
         );
-        let req = CompletionRequest::new(vec![Message::user("hi")])
-            .with_tools(vec![tool.clone()])
+        let ctx = Context::new(vec![Message::user("hi")])
+            .with_system("Be terse.")
+            .with_tools(vec![tool.clone()]);
+        assert_eq!(ctx.system_prompt.as_deref(), Some("Be terse."));
+        assert_eq!(ctx.tools, vec![tool]);
+        assert_eq!(ctx.messages.len(), 1);
+    }
+
+    #[test]
+    fn context_defaults_to_no_system_and_no_tools() {
+        let ctx = Context::new(vec![Message::user("hi")]);
+        assert_eq!(ctx.system_prompt, None);
+        assert!(ctx.tools.is_empty());
+    }
+
+    #[test]
+    fn push_appends_a_turn() {
+        let mut ctx = Context::new(vec![Message::user("hi")]);
+        ctx.push(Message::user("again"));
+        assert_eq!(ctx.messages.len(), 2);
+    }
+
+    #[test]
+    fn options_builders_set_the_knobs() {
+        let opts = CompletionOptions::default()
+            .with_temperature(0.5)
+            .with_max_tokens(256)
             .with_tool_choice(ToolChoice::Tool("get_weather".to_owned()));
-        assert_eq!(req.tools, vec![tool]);
+        assert_eq!(opts.temperature, Some(0.5));
+        assert_eq!(opts.max_tokens, Some(256));
         assert_eq!(
-            req.tool_choice,
+            opts.tool_choice,
             Some(ToolChoice::Tool("get_weather".to_owned()))
         );
     }
 
     #[test]
-    fn tools_default_to_empty() {
-        let req = CompletionRequest::new(vec![Message::user("hi")]);
-        assert!(req.tools.is_empty());
-        assert_eq!(req.tool_choice, None);
+    fn options_default_to_provider_defaults() {
+        let opts = CompletionOptions::default();
+        assert_eq!(opts.temperature, None);
+        assert_eq!(opts.max_tokens, None);
+        assert_eq!(opts.tool_choice, None);
     }
 }

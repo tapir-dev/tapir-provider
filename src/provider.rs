@@ -4,8 +4,8 @@
 //! The object-safe [`Provider`] trait.
 
 use crate::error::{Error, ErrorKind};
-use crate::request::CompletionRequest;
-use crate::response::CompletionResponse;
+use crate::message::AssistantMessage;
+use crate::request::{CompletionOptions, Context};
 use crate::stream::StreamEvents;
 use async_trait::async_trait;
 
@@ -14,13 +14,20 @@ use async_trait::async_trait;
 /// The trait is object-safe so Providers can be held as `Arc<dyn Provider>` and
 /// supplied by third parties. The transport an implementation uses is its own
 /// concern, injected on the concrete struct rather than surfaced here.
+///
+/// A call takes the conversational [`Context`] and the per-request
+/// [`CompletionOptions`] by reference, so one set of options can drive several
+/// turns over a growing context, and returns an [`AssistantMessage`] that is
+/// itself a [`Message`](crate::message::Message) — appended back into the
+/// context for the next turn.
 #[async_trait]
 pub trait Provider: Send + Sync {
-    /// Produce a single, non-streaming completion for the given request.
+    /// Produce a single, non-streaming completion for the given context.
     async fn complete(
         &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, Error>;
+        ctx: &Context,
+        opts: &CompletionOptions,
+    ) -> Result<AssistantMessage, Error>;
 
     /// Stream a completion as ordered, incremental
     /// [`StreamEvent`](crate::stream::StreamEvent)s.
@@ -29,12 +36,13 @@ pub trait Provider: Send + Sync {
     /// unsupported, so a Provider that only completes need not implement it. A
     /// caller who ignores the deltas can fold the stream through a
     /// [`StreamAccumulator`](crate::stream::StreamAccumulator) to recover the
-    /// same completion [`complete`](Self::complete) would return.
+    /// same [`AssistantMessage`] [`complete`](Self::complete) would return.
     async fn complete_stream(
         &self,
-        request: CompletionRequest,
+        ctx: &Context,
+        opts: &CompletionOptions,
     ) -> Result<StreamEvents, Error> {
-        let _ = request;
+        let _ = (ctx, opts);
         Err(Error::new(
             ErrorKind::Other,
             "this Provider does not support streaming",
@@ -49,16 +57,18 @@ pub trait Provider: Send + Sync {
 impl<T: Provider + ?Sized> Provider for std::sync::Arc<T> {
     async fn complete(
         &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, Error> {
-        (**self).complete(request).await
+        ctx: &Context,
+        opts: &CompletionOptions,
+    ) -> Result<AssistantMessage, Error> {
+        (**self).complete(ctx, opts).await
     }
 
     async fn complete_stream(
         &self,
-        request: CompletionRequest,
+        ctx: &Context,
+        opts: &CompletionOptions,
     ) -> Result<StreamEvents, Error> {
-        (**self).complete_stream(request).await
+        (**self).complete_stream(ctx, opts).await
     }
 }
 
