@@ -8,9 +8,12 @@ pub mod oauth;
 
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
-use crate::http::{HttpClient, HttpRequest, Method};
+use crate::http::HttpClient;
 use crate::message::{
     AssistantMessage, ContentPart, ImageSource, Message, ToolResultMessage,
+};
+use crate::pipeline::{
+    CompletionPipeline, Streaming, WireAdapter, redacted_headers,
 };
 use crate::provider::Provider;
 use crate::request::{
@@ -19,9 +22,7 @@ use crate::request::{
 };
 use crate::response::{FinishReason, Usage, mint_call_id};
 use crate::sse::SseEvent;
-use crate::stream::{
-    SseEventStream, StreamEvent, StreamEvents, StreamNormalizer,
-};
+use crate::stream::{StreamEvent, StreamEvents, StreamNormalizer};
 use crate::token_store::{TokenStore, resolve};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -63,25 +64,6 @@ const CLAUDE_CODE_IDENTITY: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
 /// Longest tool name Anthropic accepts; the OAuth lane truncates to this.
 const MAX_TOOL_NAME_LEN: usize = 128;
-
-/// Whether a request opts into a streamed (SSE) response.
-///
-/// A named alternative to a bare `bool` at the call sites that build the wire
-/// request, so `Streaming::On` reads for itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Streaming {
-    /// Request an incremental SSE response.
-    On,
-    /// Request a single buffered response.
-    Off,
-}
-
-impl Streaming {
-    /// Whether streaming is requested, as the wire `stream` flag.
-    const fn enabled(self) -> bool {
-        matches!(self, Self::On)
-    }
-}
 
 /// Which authentication lane a request is shaped for.
 ///
@@ -136,44 +118,84 @@ pub(crate) fn auth_headers(credential: &Credential) -> Vec<(String, String)> {
     headers
 }
 
-/// A Provider for Anthropic's Messages API.
+/// The Anthropic wire specifics behind the shared [`CompletionPipeline`].
 ///
-/// The transport is injected as the generic `H`, which erases to
-/// `Arc<dyn Provider>` at registration. The addressable Model is fixed when the
-/// Provider is built.
-#[derive(Clone)]
-pub struct AnthropicProvider<H> {
-    http: H,
-    credential: Credential,
-    model: String,
-    base_url: String,
-    /// Caller-supplied headers appended to every request, after the Provider's
-    /// own auth and version headers. For proxies and gateways that key off a
-    /// bespoke header.
-    extra_headers: Vec<(String, String)>,
-}
+/// It supplies only what genuinely varies for Anthropic: the Messages endpoint,
+/// the `x-api-key`/`Bearer` auth headers, the request body (whose auth lane it
+/// derives from the Credential it is handed), the response mapping into an
+/// [`AssistantMessage`], the SSE [`AnthropicStreamNormalizer`], and the
+/// extended-cache beta header that [`Extended`](CachePolicy::Extended)
+/// retention requires. The pipeline owns everything invariant around these, so
+/// nothing else about the Anthropic wire lives outside this adapter.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AnthropicWire;
 
-/// Redacts header *values*, keeping names visible: a caller-supplied header may
-/// carry a secret (a proxy authorization token), so its value never reaches
-/// Debug output — matching the crate's [`Credential`] redaction discipline.
-fn redacted_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
-    headers
-        .iter()
-        .map(|(name, _)| (name.as_str(), "<redacted>"))
-        .collect()
-}
+impl WireAdapter for AnthropicWire {
+    type Response = WireResponse;
+    type Normalizer = AnthropicStreamNormalizer;
 
-impl<H: fmt::Debug> fmt::Debug for AnthropicProvider<H> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AnthropicProvider")
-            .field("http", &self.http)
-            .field("credential", &self.credential)
-            .field("model", &self.model)
-            .field("base_url", &self.base_url)
-            .field("extra_headers", &redacted_headers(&self.extra_headers))
-            .finish()
+    fn endpoint(&self) -> &str {
+        "/v1/messages"
+    }
+
+    fn auth_headers(&self, credential: &Credential) -> Vec<(String, String)> {
+        auth_headers(credential)
+    }
+
+    fn request_body(
+        &self,
+        model: &str,
+        ctx: &Context,
+        opts: &CompletionOptions,
+        streaming: Streaming,
+        credential: &Credential,
+    ) -> Result<Vec<u8>, Error> {
+        // The auth lane stays internal to the adapter, derived here from the
+        // Credential this request authenticates with: an explicit per-request
+        // key arrives as an api-key Credential, so it always rides that lane.
+        let lane = AuthLane::for_credential(credential);
+        serde_json::to_vec(&WireRequest::from_context(
+            model, ctx, opts, streaming, lane,
+        ))
+        .map_err(Error::serialize)
+    }
+
+    fn map_message(
+        &self,
+        response: WireResponse,
+        raw: serde_json::Value,
+    ) -> AssistantMessage {
+        response.into_message(raw)
+    }
+
+    fn normalizer(&self) -> AnthropicStreamNormalizer {
+        AnthropicStreamNormalizer::default()
+    }
+
+    fn augment_headers(
+        &self,
+        headers: &mut Vec<(String, String)>,
+        opts: &CompletionOptions,
+    ) {
+        // Extended retention needs its beta merged onto whatever the lane
+        // already sends. Derived from the same `opts.cache` that shaped the body
+        // marker, so the 1h header and the 1h marker travel together.
+        if let Some(beta) = cache_shaping(opts.cache).and_then(|s| s.beta) {
+            merge_anthropic_beta(headers, beta);
+        }
     }
 }
+
+/// A Provider for Anthropic's Messages API.
+///
+/// A newtype over the shared `CompletionPipeline` driving an `AnthropicWire`
+/// adapter: the pipeline carries the invariant send / success-gate / decode /
+/// stream-wrap flow and holds the Provider fields (transport `H`, Credential,
+/// Model, base URL, extra headers), while this type preserves the existing
+/// construction surface unchanged. It erases to `Arc<dyn Provider>` at
+/// registration; the addressable Model is fixed when the Provider is built.
+#[derive(Clone, Debug)]
+pub struct AnthropicProvider<H>(CompletionPipeline<H, AnthropicWire>);
 
 impl<H: HttpClient> AnthropicProvider<H> {
     /// Build a Provider for the given Model, authenticating with `credential`
@@ -193,13 +215,13 @@ impl<H: HttpClient> AnthropicProvider<H> {
                 .ok()
                 .flatten()
                 .expect("an explicit Credential always resolves");
-        Self {
+        Self(CompletionPipeline::new(
             http,
+            AnthropicWire,
             credential,
-            model: model.into(),
-            base_url: DEFAULT_BASE_URL.to_owned(),
-            extra_headers: Vec::new(),
-        }
+            model,
+            DEFAULT_BASE_URL,
+        ))
     }
 
     /// Build a Provider by resolving its Credential from a Token Store, then
@@ -241,80 +263,29 @@ impl<H: HttpClient> AnthropicProvider<H> {
 
     /// Override the base URL (for proxies, gateways, or a test server).
     #[must_use]
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
+    pub fn with_base_url(self, base_url: impl Into<String>) -> Self {
+        Self(self.0.with_base_url(base_url))
     }
 
     /// Append an extra header sent with every request, after the Provider's own
     /// auth and version headers.
     #[must_use]
     pub fn with_header(
-        mut self,
+        self,
         name: impl Into<String>,
         value: impl Into<String>,
     ) -> Self {
-        self.extra_headers.push((name.into(), value.into()));
-        self
+        Self(self.0.with_header(name, value))
     }
 
     /// Append extra headers sent with every request, after the Provider's own
     /// auth and version headers.
     #[must_use]
     pub fn with_headers(
-        mut self,
+        self,
         headers: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        self.extra_headers.extend(headers);
-        self
-    }
-
-    fn build_http_request(
-        &self,
-        ctx: &Context,
-        opts: &CompletionOptions,
-        streaming: Streaming,
-    ) -> Result<HttpRequest, Error> {
-        // An explicit per-request key overrides the constructed Credential for
-        // this call; an explicit key always rides the api-key lane.
-        let override_credential =
-            opts.api_key.as_deref().map(Credential::api_key);
-        let credential =
-            override_credential.as_ref().unwrap_or(&self.credential);
-        let lane = AuthLane::for_credential(credential);
-
-        let body = serde_json::to_vec(&WireRequest::from_context(
-            &self.model,
-            ctx,
-            opts,
-            streaming,
-            lane,
-        ))
-        .map_err(Error::serialize)?;
-
-        let url =
-            format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let request = HttpRequest::new(Method::Post, url)
-            .header("content-type", "application/json");
-        // Assemble auth (version and the lane's secret, so the wire matches what
-        // auth inspection reports) then construction-time headers, and let the
-        // per-request options append their static headers and run the Header
-        // Transform with the final say.
-        let mut base: Vec<(String, String)> = auth_headers(credential)
-            .into_iter()
-            .chain(self.extra_headers.iter().cloned())
-            .collect();
-        // Extended retention needs its beta merged onto whatever the lane
-        // already sends. Derived from the same `opts.cache` that shaped the body
-        // marker, so the 1h header and the 1h marker travel together.
-        if let Some(beta) = cache_shaping(opts.cache).and_then(|s| s.beta) {
-            merge_anthropic_beta(&mut base, beta);
-        }
-        let request = opts
-            .finalize_headers(base)
-            .into_iter()
-            .fold(request, |req, (name, value)| req.header(name, value));
-        Ok(request.body(body))
+        Self(self.0.with_headers(headers))
     }
 }
 
@@ -412,20 +383,7 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
         ctx: &Context,
         opts: &CompletionOptions,
     ) -> Result<AssistantMessage, Error> {
-        let http_request =
-            self.build_http_request(ctx, opts, Streaming::Off)?;
-        let response = self.http.send(http_request).await?;
-
-        if !response.is_success() {
-            return Err(crate::http::error_from_response(&response));
-        }
-
-        let wire: WireResponse =
-            serde_json::from_slice(&response.body).map_err(Error::decode)?;
-        let raw: serde_json::Value =
-            serde_json::from_slice(&response.body).map_err(Error::decode)?;
-
-        Ok(wire.into_message(raw))
+        self.0.complete(ctx, opts).await
     }
 
     async fn complete_stream(
@@ -433,12 +391,7 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
         ctx: &Context,
         opts: &CompletionOptions,
     ) -> Result<StreamEvents, Error> {
-        let http_request = self.build_http_request(ctx, opts, Streaming::On)?;
-        let bytes = self.http.send_stream(http_request).await?;
-        Ok(Box::pin(SseEventStream::new(
-            bytes,
-            AnthropicStreamNormalizer::default(),
-        )))
+        self.0.complete_stream(ctx, opts).await
     }
 }
 
@@ -450,7 +403,7 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
 /// text, thinking, or tool calls (so a `content_block_stop` becomes the matching
 /// `*End` event), and the replay signature accumulated for each thinking block.
 #[derive(Debug, Default)]
-struct AnthropicStreamNormalizer {
+pub(crate) struct AnthropicStreamNormalizer {
     /// Input tokens, reported in `message_start`.
     input_tokens: u32,
     /// Output tokens, reported cumulatively in `message_delta`.
@@ -1140,7 +1093,7 @@ fn wire_image_source(source: &ImageSource) -> WireImageSource<'_> {
 
 /// The Anthropic response body.
 #[derive(Debug, Deserialize)]
-struct WireResponse {
+pub(crate) struct WireResponse {
     #[serde(default)]
     content: Vec<WireContentBlock>,
     stop_reason: Option<String>,
@@ -1228,7 +1181,7 @@ fn map_finish_reason(stop_reason: Option<String>) -> FinishReason {
 mod tests {
     use super::*;
     use crate::credential::OAuthTokens;
-    use crate::http::MockHttpClient;
+    use crate::http::{Method, MockHttpClient};
     use crate::message::{MediaType, Message};
     use crate::stream::StreamAccumulator;
     use futures_util::StreamExt;

@@ -17,9 +17,9 @@
 //! shared fields the pipeline holds (transport, Credential, Model, base URL, and
 //! extra headers).
 
-// Nothing is migrated onto the pipeline yet; the Providers move over in later
-// work (see issues #30 and #31), which is when these items gain non-test
-// callers. Until then they are exercised only by this module's tests.
+// The Anthropic Provider rides this pipeline; the OpenAI Provider moves over in
+// later work (see issue #31). A few items are still reached only by the
+// Anthropic path or this module's tests until then.
 #![allow(dead_code)]
 
 use crate::credential::Credential;
@@ -135,6 +135,7 @@ pub(crate) trait WireAdapter: Send + Sync {
 /// [`Provider`] once here gives every adapter both a buffered `complete` and a
 /// streamed `complete_stream` without repeating the send, the success gate, the
 /// error classification, the double-decode, or the stream-driver wrap.
+#[derive(Clone)]
 pub(crate) struct CompletionPipeline<H, A> {
     /// The transport all wire I/O flows through.
     http: H,
@@ -154,7 +155,9 @@ pub(crate) struct CompletionPipeline<H, A> {
 /// Redacts header *values*, keeping names visible: a caller-supplied header may
 /// carry a secret, so its value never reaches Debug output, matching the crate's
 /// [`Credential`] redaction discipline.
-fn redacted_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn redacted_headers(
+    headers: &[(String, String)],
+) -> Vec<(&str, &str)> {
     headers
         .iter()
         .map(|(name, _)| (name.as_str(), "<redacted>"))
@@ -194,13 +197,33 @@ impl<H, A> CompletionPipeline<H, A> {
         }
     }
 
-    /// Set the extra headers appended to every request.
+    /// Override the base URL the endpoint path is appended to.
+    #[must_use]
+    pub(crate) fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    /// Append a single extra header sent with every request, after the adapter's
+    /// own auth headers.
+    #[must_use]
+    pub(crate) fn with_header(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Append extra headers sent with every request, after the adapter's own
+    /// auth headers.
     #[must_use]
     pub(crate) fn with_headers(
         mut self,
         headers: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
-        self.extra_headers = headers.into_iter().collect();
+        self.extra_headers.extend(headers);
         self
     }
 }
