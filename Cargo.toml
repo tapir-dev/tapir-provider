@@ -1,3 +1,13 @@
+[workspace]
+# The root crate is the shipped library; `xtask` is a dev-only tool (the model
+# catalog generator). `default-members` keeps `xtask` out of the default build,
+# test, and clippy runs — it is built on demand via `cargo run -p xtask`. `fuzz`
+# stays its own standalone package, excluded from this workspace.
+members = ["xtask"]
+default-members = ["."]
+exclude = ["fuzz"]
+resolver = "3"
+
 [package]
 name = "tapir-provider"
 version = "0.1.0"

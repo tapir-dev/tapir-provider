@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+license = "ISC"
+publish = false
+description = "Dev tooling for tapir-provider (model catalog generation)."
+
+[dependencies]
+# The generator maps upstream data onto the crate's own Model schema, so the
+# committed JSON is validated against it by construction.
+tapir-provider = { path = "..", features = ["models", "anthropic", "openai"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Reuse the same HTTP stack as the crate; `blocking` keeps the generator a plain
+# synchronous binary with no async runtime of its own to manage.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "blocking",
+] }

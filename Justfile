@@ -69,6 +69,11 @@ license:
     done < <(git ls-files --cached --others --exclude-standard -- '*.rs' '*.py')
     [ "$fail" -eq 0 ] || { echo "Headers must match src/lib.rs (SPDX-License-Identifier + Copyright line)." >&2; exit 1; }
 
+# Regenerate the committed baseline model catalog from upstream data (needs network).
+# Writes assets/models/<provider>.json; builds stay offline afterward. See ADR-0006.
+gen-models:
+    cargo run --quiet --package xtask -- gen-models
+
 # Lint the GitHub Actions workflows.
 actionlint:
     actionlint
