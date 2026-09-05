@@ -43,6 +43,14 @@ The authentication material for a Provider: either an API key or an OAuth token 
 (access token, refresh token, expiry). One tagged value that round-trips losslessly.
 _Avoid_: Auth, key, secret (each names only part of it).
 
+**Provider Config**:
+A set of provider-scoped, non-secret config values carried on an API-key Credential
+alongside its key — for example a gateway's account and gateway ids. Serialized under
+the `env` wire key (the Rust field stays `config`, since `env` already names the
+environment-variable auth tier in code). Distinct from a Credential's round-trip-only
+`extra` bag: a wire `env` lands in this typed field, other unmodeled fields in `extra`.
+_Avoid_: Env, settings, options.
+
 **Token Store**:
 The persistence boundary for Credentials. The SDK reads and writes through it and
 owns refresh; the caller chooses where they live (file, OS keychain, ...).

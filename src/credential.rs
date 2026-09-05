@@ -3,6 +3,7 @@
 
 //! The [`Credential`] authentication material carried by a Provider.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,15 @@ pub enum Credential {
     ApiKey {
         /// The secret key sent to the Provider.
         key: String,
+        /// Provider-scoped, non-secret config values carried alongside the key
+        /// (a Provider Config) — for example a gateway's account and gateway
+        /// ids. Serialized under the `env` wire key; omitted when empty.
+        #[serde(
+            rename = "env",
+            default,
+            skip_serializing_if = "BTreeMap::is_empty"
+        )]
+        config: BTreeMap<String, String>,
         /// Fields present on the wire that this version does not model.
         #[serde(flatten, default)]
         extra: Map<String, Value>,
@@ -37,7 +47,31 @@ impl Credential {
     pub fn api_key(key: impl Into<String>) -> Self {
         Self::ApiKey {
             key: key.into(),
+            config: BTreeMap::new(),
             extra: Map::new(),
+        }
+    }
+
+    /// Fold Provider Config entries into an API-key Credential's config.
+    ///
+    /// A no-op on OAuth Credentials, which carry no Provider Config.
+    #[must_use]
+    pub fn with_config(
+        mut self,
+        entries: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        if let Self::ApiKey { config, .. } = &mut self {
+            config.extend(entries);
+        }
+        self
+    }
+
+    /// The Provider Config, if this Credential is an API key.
+    #[must_use]
+    pub fn config(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            Self::ApiKey { config, .. } => Some(config),
+            Self::OAuth(_) => None,
         }
     }
 
@@ -231,5 +265,66 @@ mod tests {
         let back = serde_json::to_value(&cred).unwrap();
         assert_eq!(back["key"], "sk-x");
         assert_eq!(back["label"], "prod");
+    }
+
+    #[test]
+    fn with_config_folds_entries_and_config_reads_them_back() {
+        let cred = Credential::api_key("sk-x")
+            .with_config([("CLOUDFLARE_ACCOUNT_ID".into(), "acct".into())]);
+        let config = cred.config().expect("api key config");
+        assert_eq!(config["CLOUDFLARE_ACCOUNT_ID"], "acct");
+    }
+
+    #[test]
+    fn with_config_is_a_no_op_on_oauth() {
+        let cred = Credential::oauth(OAuthTokens::new("acc", "ref", None))
+            .with_config([("K".into(), "v".into())]);
+        assert_eq!(cred.config(), None);
+    }
+
+    #[test]
+    fn config_is_some_and_empty_for_a_bare_api_key() {
+        let cred = Credential::api_key("sk-x");
+        assert!(cred.config().expect("api key config").is_empty());
+    }
+
+    #[test]
+    fn config_serializes_as_a_nested_env_object() {
+        let cred = Credential::api_key("sk-x")
+            .with_config([("CLOUDFLARE_ACCOUNT_ID".into(), "acct".into())]);
+        let json = serde_json::to_value(&cred).unwrap();
+        assert_eq!(json["type"], "api_key");
+        assert_eq!(json["key"], "sk-x");
+        assert_eq!(json["env"]["CLOUDFLARE_ACCOUNT_ID"], "acct");
+    }
+
+    #[test]
+    fn empty_config_is_omitted_from_the_wire() {
+        let json = serde_json::to_value(Credential::api_key("sk-x")).unwrap();
+        assert!(json.get("env").is_none());
+    }
+
+    #[test]
+    fn wire_env_deserializes_into_config_not_extra() {
+        let wire = r#"{"type":"api_key","key":"sk-x","env":{"ACCT":"a"},"label":"prod"}"#;
+        let cred: Credential = serde_json::from_str(wire).unwrap();
+        let config = cred.config().expect("api key config");
+        assert_eq!(config["ACCT"], "a");
+
+        // The unmodeled field still round-trips; env is not duplicated there.
+        let back = serde_json::to_value(&cred).unwrap();
+        assert_eq!(back["label"], "prod");
+        assert_eq!(back["env"]["ACCT"], "a");
+    }
+
+    #[test]
+    fn config_round_trips_through_serialization() {
+        let cred = Credential::api_key("sk-x").with_config([
+            ("ACCT".into(), "a".into()),
+            ("GATEWAY".into(), "g".into()),
+        ]);
+        let json = serde_json::to_string(&cred).unwrap();
+        let back: Credential = serde_json::from_str(&json).unwrap();
+        assert_eq!(cred, back);
     }
 }
