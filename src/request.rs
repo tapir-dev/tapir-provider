@@ -157,6 +157,28 @@ impl ThinkingLevel {
     }
 }
 
+/// How aggressively a Provider is asked to reuse a cached prefix of the request
+/// rather than reprocess it.
+///
+/// This is a Provider-neutral cost level, not a wire directive: a Provider that
+/// caches implicitly (or not at all) ignores it, and a Provider that places
+/// explicit cache breakpoints derives their shape from the level. [`Off`](Self::Off)
+/// is the neutral "no reuse" and the default.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum CachePolicy {
+    /// No prefix reuse; the request is processed in full.
+    #[default]
+    Off,
+    /// Reuse a cached prefix with short retention.
+    Standard,
+    /// Reuse a cached prefix with longer retention where the Provider supports it.
+    Extended,
+}
+
 /// How the model is steered toward (or away from) calling a tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -225,8 +247,9 @@ impl Context {
 /// The per-request knobs that steer generation.
 ///
 /// These describe how to sample, not what the conversation is: the sampling
-/// temperature, the output-token cap, and the tool choice. Passed alongside a
-/// [`Context`], so one set of options can drive several turns.
+/// temperature, the output-token cap, the tool choice, the Thinking Level, and
+/// the Cache Policy. Passed alongside a [`Context`], so one set of options can
+/// drive several turns.
 ///
 /// The [`transform_headers`](Self::transform_headers) field holds an
 /// `Arc<dyn Fn>`, which cannot derive `PartialEq` or `Debug`. Following the
@@ -245,6 +268,10 @@ pub struct CompletionOptions {
     /// How hard the model should reason before answering; `None` leaves thinking
     /// off. Providers without extended thinking ignore it.
     pub thinking: Option<ThinkingLevel>,
+    /// How aggressively the Provider should reuse a cached prefix of the request.
+    /// [`Off`](CachePolicy::Off) is the neutral "no reuse"; Providers that cache
+    /// implicitly, or not at all, ignore it.
+    pub cache: CachePolicy,
     /// An explicit API key that authenticates this one request, overriding the
     /// Credential the Provider was built with. `None` leaves the Provider's own
     /// Credential in force; a set value always wins and is sent on the
@@ -269,6 +296,7 @@ impl fmt::Debug for CompletionOptions {
             .field("max_tokens", &self.max_tokens)
             .field("tool_choice", &self.tool_choice)
             .field("thinking", &self.thinking)
+            .field("cache", &self.cache)
             .field("api_key", &self.api_key)
             .field("headers", &self.headers)
             .field(
@@ -308,6 +336,14 @@ impl CompletionOptions {
     #[must_use]
     pub fn with_thinking(mut self, level: ThinkingLevel) -> Self {
         self.thinking = Some(level);
+        self
+    }
+
+    /// Ask the Provider to reuse a cached prefix of the request at the given
+    /// level.
+    #[must_use]
+    pub fn with_cache(mut self, policy: CachePolicy) -> Self {
+        self.cache = policy;
         self
     }
 
@@ -439,6 +475,31 @@ mod tests {
         let opts =
             CompletionOptions::default().with_thinking(ThinkingLevel::High);
         assert_eq!(opts.thinking, Some(ThinkingLevel::High));
+    }
+
+    #[test]
+    fn cache_defaults_to_off_and_the_builder_sets_it() {
+        assert_eq!(CachePolicy::default(), CachePolicy::Off);
+        assert_eq!(CompletionOptions::default().cache, CachePolicy::Off);
+        let opts =
+            CompletionOptions::default().with_cache(CachePolicy::Standard);
+        assert_eq!(opts.cache, CachePolicy::Standard);
+    }
+
+    #[test]
+    fn cache_policy_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(CachePolicy::Off).unwrap(),
+            serde_json::json!("off")
+        );
+        assert_eq!(
+            serde_json::to_value(CachePolicy::Standard).unwrap(),
+            serde_json::json!("standard")
+        );
+        assert_eq!(
+            serde_json::to_value(CachePolicy::Extended).unwrap(),
+            serde_json::json!("extended")
+        );
     }
 
     #[test]

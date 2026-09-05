@@ -107,9 +107,9 @@ _Avoid_: Conversation, session, prompt, request.
 
 **Completion Options**:
 The per-request knobs that steer generation rather than describe the conversation:
-sampling temperature, output-token cap, tool choice, and Thinking Level. It also
-carries the request's per-request headers and its Header Transform. Passed alongside
-the Context.
+sampling temperature, output-token cap, tool choice, Thinking Level, and Cache
+Policy. It also carries the request's per-request headers and its Header Transform.
+Passed alongside the Context.
 _Avoid_: Config, settings, params.
 
 **Header Transform**:
@@ -124,6 +124,14 @@ How hard the model is asked to reason before answering, as a Provider-neutral ef
 level rather than a raw token budget. A Provider that reasons by budget derives one
 from the level; a Provider without extended thinking ignores it.
 _Avoid_: Reasoning effort (as a wire term), budget, thinking tokens.
+
+**Cache Policy**:
+How aggressively a Provider is asked to reuse a cached prefix of the request rather
+than reprocess it, as a Provider-neutral level: Off (no reuse), Standard (short
+retention), or Extended (longer retention where the Provider supports it). Carried on
+the Completion Options as a per-request cost knob. A Provider that caches implicitly,
+or not at all, ignores it.
+_Avoid_: Prompt caching, cache control, breakpoint, ephemeral, TTL.
 
 **Assistant Message**:
 A reply produced by the model: its content parts (text, Thinking, and Tool Calls),

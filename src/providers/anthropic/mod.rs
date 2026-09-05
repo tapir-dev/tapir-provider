@@ -14,8 +14,8 @@ use crate::message::{
 };
 use crate::provider::Provider;
 use crate::request::{
-    CompletionOptions, Context, SystemPrompt, ThinkingLevel, ToolChoice,
-    ToolDefinition,
+    CachePolicy, CompletionOptions, Context, SystemPrompt, ThinkingLevel,
+    ToolChoice, ToolDefinition,
 };
 use crate::response::{FinishReason, Usage, mint_call_id};
 use crate::sse::{SseDecoder, SseEvent};
@@ -696,6 +696,35 @@ fn is_false(flag: &bool) -> bool {
     !*flag
 }
 
+/// Anthropic's `cache_control` marker that turns the block carrying it into a
+/// cache breakpoint: the request prefix up to and including it is cached.
+///
+/// `Standard` retention emits the bare `{"type":"ephemeral"}` form — no `ttl`,
+/// and no cache beta header, since base prompt caching is generally available.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// The `cache_control` marker a [`CachePolicy`] places, or `None` for
+/// [`Off`](CachePolicy::Off), which leaves the request unmarked.
+///
+/// A non-`Off` policy marks its breakpoints with the `ephemeral` marker; the
+/// retention shaping is derived from the one policy value so body and header
+/// cannot drift.
+fn cache_marker(policy: CachePolicy) -> Option<CacheControl> {
+    match policy {
+        CachePolicy::Off => None,
+        // Standard places the bare ephemeral marker. Extended shares it for now:
+        // its longer-retention `ttl` and the beta header it needs are not wired
+        // yet, so it caches with Standard's shaping rather than doing nothing.
+        CachePolicy::Standard | CachePolicy::Extended => {
+            Some(CacheControl { kind: "ephemeral" })
+        }
+    }
+}
+
 impl<'a> WireRequest<'a> {
     fn from_context(
         model: &'a str,
@@ -704,14 +733,31 @@ impl<'a> WireRequest<'a> {
         streaming: Streaming,
         lane: AuthLane,
     ) -> Self {
-        let messages = ctx.messages.iter().map(wire_message).collect();
-        let system = wire_system(ctx.system_prompt.as_ref(), lane);
+        let mut messages: Vec<WireMessage<'a>> =
+            ctx.messages.iter().map(wire_message).collect();
+        let mut system = wire_system(ctx.system_prompt.as_ref(), lane);
 
-        let tools = ctx
+        let mut tools: Vec<WireTool<'a>> = ctx
             .tools
             .iter()
             .map(|tool| WireTool::from_tool(tool, lane))
             .collect();
+
+        // A non-`Off` Cache Policy places up to three fixed breakpoints,
+        // skipping any that are absent: the last tool, the last system block,
+        // and the final block of the last message. Marking promotes only the
+        // affected block to the array form; every other message stays compact.
+        if let Some(marker) = cache_marker(opts.cache) {
+            if let Some(tool) = tools.last_mut() {
+                tool.cache_control = Some(marker);
+            }
+            if let Some(system) = system.as_mut() {
+                mark_system(system, marker);
+            }
+            if let Some(message) = messages.last_mut() {
+                mark_message(&mut message.content, marker);
+            }
+        }
 
         // Extended thinking, when asked for, reasons by token budget derived
         // from the neutral level. It shares the response ceiling with the
@@ -777,6 +823,7 @@ fn wire_tool_result(result: &ToolResultMessage) -> WireContent<'_> {
         tool_use_id: &result.tool_call_id,
         content: tool_result_text(&result.content),
         is_error: result.is_error,
+        cache_control: None,
     }])
 }
 
@@ -816,6 +863,8 @@ struct WireSystemBlock {
     #[serde(rename = "type")]
     block_type: &'static str,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 impl WireSystemBlock {
@@ -824,6 +873,7 @@ impl WireSystemBlock {
         Self {
             block_type: "text",
             text: text.into(),
+            cache_control: None,
         }
     }
 }
@@ -879,6 +929,8 @@ struct WireTool<'a> {
     name: Cow<'a, str>,
     description: &'a str,
     input_schema: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 impl<'a> WireTool<'a> {
@@ -893,6 +945,7 @@ impl<'a> WireTool<'a> {
             name,
             description: &tool.description,
             input_schema: &tool.input_schema,
+            cache_control: None,
         }
     }
 }
@@ -935,21 +988,44 @@ enum WireContent<'a> {
 enum WireContentPart<'a> {
     Text {
         text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     Image {
         source: WireImageSource<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: &'a str,
         name: &'a str,
         input: &'a serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolResult {
         tool_use_id: &'a str,
         content: Cow<'a, str>,
         #[serde(skip_serializing_if = "is_false")]
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
+}
+
+impl WireContentPart<'_> {
+    /// Mark this block as a cache breakpoint, whatever its kind. `cache_control`
+    /// is a per-block property Anthropic accepts on any content block.
+    fn set_cache_control(&mut self, marker: CacheControl) {
+        match self {
+            Self::Text { cache_control, .. }
+            | Self::Image { cache_control, .. }
+            | Self::ToolUse { cache_control, .. }
+            | Self::ToolResult { cache_control, .. } => {
+                *cache_control = Some(marker);
+            }
+        }
+    }
 }
 
 /// An image block's `source` in the Anthropic request body.
@@ -979,13 +1055,60 @@ fn wire_content(parts: &[ContentPart]) -> WireContent<'_> {
     WireContent::Blocks(parts.iter().filter_map(wire_content_part).collect())
 }
 
+/// Mark the last system block as a cache breakpoint.
+///
+/// The compact string form cannot carry a `cache_control` marker, so it is
+/// promoted to a single text block; the block-array form marks its final block
+/// in place, leaving the rest untouched.
+fn mark_system(system: &mut WireSystem, marker: CacheControl) {
+    match system {
+        WireSystem::Text(text) => {
+            let mut block = WireSystemBlock::text(std::mem::take(text));
+            block.cache_control = Some(marker);
+            *system = WireSystem::Blocks(vec![block]);
+        }
+        WireSystem::Blocks(blocks) => {
+            if let Some(last) = blocks.last_mut() {
+                last.cache_control = Some(marker);
+            }
+        }
+    }
+}
+
+/// Mark the final content block of a message as a cache breakpoint.
+///
+/// A message sent in the compact string form is promoted to a single text block
+/// so it can carry the marker; every other message keeps its compact form. A
+/// message whose block list is empty has nothing to mark and is left as is.
+fn mark_message<'a>(content: &mut WireContent<'a>, marker: CacheControl) {
+    match content {
+        WireContent::Text(text) => {
+            let mut part = WireContentPart::Text {
+                text,
+                cache_control: None,
+            };
+            part.set_cache_control(marker);
+            *content = WireContent::Blocks(vec![part]);
+        }
+        WireContent::Blocks(parts) => {
+            if let Some(last) = parts.last_mut() {
+                last.set_cache_control(marker);
+            }
+        }
+    }
+}
+
 /// Map one neutral content part onto an Anthropic content block, or `None` for a
 /// part with no request-content representation.
 fn wire_content_part(part: &ContentPart) -> Option<WireContentPart<'_>> {
     match part {
-        ContentPart::Text(text) => Some(WireContentPart::Text { text }),
+        ContentPart::Text(text) => Some(WireContentPart::Text {
+            text,
+            cache_control: None,
+        }),
         ContentPart::Image(source) => Some(WireContentPart::Image {
             source: wire_image_source(source),
+            cache_control: None,
         }),
         ContentPart::ToolCall {
             id,
@@ -995,6 +1118,7 @@ fn wire_content_part(part: &ContentPart) -> Option<WireContentPart<'_>> {
             id,
             name,
             input: arguments,
+            cache_control: None,
         }),
         // Thinking is not replayed on the request without its full block shape.
         ContentPart::Thinking { .. } => None,
@@ -1129,6 +1253,14 @@ mod tests {
 
     /// Send one context and return its parsed JSON body.
     async fn sent_body(ctx: Context) -> serde_json::Value {
+        sent_body_opts(ctx, &opts()).await
+    }
+
+    /// Send one context with the given options and return its parsed JSON body.
+    async fn sent_body_opts(
+        ctx: Context,
+        opts: &CompletionOptions,
+    ) -> serde_json::Value {
         let mock = std::sync::Arc::new(MockHttpClient::with_response(
             200,
             SAMPLE_RESPONSE,
@@ -1138,7 +1270,7 @@ mod tests {
             Credential::api_key("sk-test"),
             "claude-3-5-sonnet",
         );
-        provider.complete(&ctx, &opts()).await.unwrap();
+        provider.complete(&ctx, opts).await.unwrap();
         serde_json::from_slice(mock.last_request().body.as_deref().unwrap())
             .unwrap()
     }
@@ -2124,5 +2256,155 @@ mod tests {
         assert_eq!(id, "toolu_9");
         assert_eq!(name, "get_weather");
         assert_eq!(arguments, &serde_json::json!({"city": "Paris"}));
+    }
+
+    /// A context exercising all three breakpoints: a tool, a system prompt, and
+    /// a trailing user message.
+    fn cacheable_context() -> Context {
+        Context::new(vec![Message::user("Hi")])
+            .with_system("Be terse.")
+            .with_tools(vec![ToolDefinition::new(
+                "get_weather",
+                "Look up the weather",
+                serde_json::json!({"type": "object"}),
+            )])
+    }
+
+    #[tokio::test]
+    async fn cache_off_emits_no_markers_anywhere() {
+        // The default policy is Off, so the body carries no cache_control.
+        let body = sent_body(cacheable_context()).await;
+
+        assert!(body["tools"][0]["cache_control"].is_null());
+        // System stays the compact string form, unpromoted.
+        assert_eq!(body["system"], "Be terse.");
+        // The message stays the compact string form.
+        assert_eq!(body["messages"][0]["content"], "Hi");
+    }
+
+    #[tokio::test]
+    async fn standard_marks_the_three_breakpoints_on_the_api_key_lane() {
+        let opts = opts().with_cache(CachePolicy::Standard);
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+        provider
+            .complete(&cacheable_context(), &opts)
+            .await
+            .unwrap();
+
+        let sent = mock.last_request();
+        let body: serde_json::Value =
+            serde_json::from_slice(sent.body.as_deref().unwrap()).unwrap();
+
+        // The last tool carries the bare ephemeral marker: no ttl.
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body["tools"][0]["cache_control"]["ttl"].is_null());
+        // The system prompt is promoted to a block array whose last block is
+        // marked.
+        assert_eq!(body["system"][0]["text"], "Be terse.");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        // The final block of the last message is marked.
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["text"], "Hi");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        // Base prompt caching is GA: Standard adds no anthropic-beta header.
+        assert!(!sent.headers.iter().any(|(k, _)| k == "anthropic-beta"));
+    }
+
+    #[tokio::test]
+    async fn standard_promotes_only_the_marked_message_to_blocks() {
+        let ctx =
+            Context::new(vec![Message::user("first"), Message::user("second")]);
+        let body =
+            sent_body_opts(ctx, &opts().with_cache(CachePolicy::Standard))
+                .await;
+
+        // The earlier message keeps its compact string form.
+        assert_eq!(body["messages"][0]["content"], "first");
+        // Only the last message is promoted to a block array and marked.
+        assert_eq!(body["messages"][1]["content"][0]["text"], "second");
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_skips_absent_tool_and_system() {
+        // No tools and no system prompt: those two breakpoints are absent, and
+        // only the trailing message is marked.
+        let ctx = Context::new(vec![Message::user("Hi")]);
+        let body =
+            sent_body_opts(ctx, &opts().with_cache(CachePolicy::Standard))
+                .await;
+
+        assert!(body.get("tools").is_none());
+        assert!(body.get("system").is_none());
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_marks_last_system_block_and_preserves_beta_on_oauth() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = oauth_provider(mock.clone());
+        let ctx =
+            Context::new(vec![Message::user("Hi")]).with_system("Be terse.");
+        provider
+            .complete(&ctx, &opts().with_cache(CachePolicy::Standard))
+            .await
+            .unwrap();
+
+        let sent = mock.last_request();
+        let body: serde_json::Value =
+            serde_json::from_slice(sent.body.as_deref().unwrap()).unwrap();
+
+        // The identity block leads and stays unmarked; the caller's block is
+        // last and carries the marker, caching identity + prompt as one prefix.
+        assert_eq!(body["system"][0]["text"], CLAUDE_CODE_IDENTITY);
+        assert!(body["system"][0]["cache_control"].is_null());
+        assert_eq!(body["system"][1]["text"], "Be terse.");
+        assert_eq!(body["system"][1]["cache_control"]["type"], "ephemeral");
+        // The existing OAuth beta flags ride unchanged; no cache beta is added.
+        assert!(
+            sent.headers.iter().any(
+                |(k, v)| k == "anthropic-beta" && v == ANTHROPIC_OAUTH_BETA
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_marks_the_identity_block_when_oauth_has_no_system() {
+        // With no caller prompt the identity block is the only, and thus last,
+        // system block, so it carries the marker.
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = oauth_provider(mock.clone());
+        let ctx = Context::new(vec![Message::user("Hi")]);
+        provider
+            .complete(&ctx, &opts().with_cache(CachePolicy::Standard))
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["system"][0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
     }
 }
