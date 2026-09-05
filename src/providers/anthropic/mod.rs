@@ -292,15 +292,17 @@ impl<H: HttpClient> AnthropicProvider<H> {
             format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let request = HttpRequest::new(Method::Post, url)
             .header("content-type", "application/json");
-        // Auth headers (version, and the lane's secret) come from the one
-        // scheme definition, so the wire matches what auth inspection reports.
-        let request = auth_headers(credential)
+        // Assemble auth (version and the lane's secret, so the wire matches what
+        // auth inspection reports) then construction-time headers, and let the
+        // per-request options append their static headers and run the Header
+        // Transform with the final say.
+        let base = auth_headers(credential)
             .into_iter()
-            .fold(request, |req, (name, value)| req.header(name, value));
-        // Caller headers ride last, so a proxy or gateway can key off them.
-        let request = self
-            .extra_headers
-            .iter()
+            .chain(self.extra_headers.iter().cloned())
+            .collect();
+        let request = opts
+            .finalize_headers(base)
+            .into_iter()
             .fold(request, |req, (name, value)| req.header(name, value));
         Ok(request.body(body))
     }
@@ -1413,6 +1415,68 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "x-api-key" && v == "sk-secret")
         );
+    }
+
+    #[tokio::test]
+    async fn per_request_headers_and_transform_reach_the_wire_in_order() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::builder(mock.clone(), "claude-3-5")
+            .credential(Credential::api_key("sk-secret"))
+            .header("x-tenant", "construction")
+            .build()
+            .unwrap();
+
+        let ctx = Context::new(vec![Message::user("hi")]);
+        let opts = opts()
+            // Per-request static headers ride after construction-time ones. One
+            // is staged only to be dropped by the transform.
+            .with_headers(vec![
+                ("x-request-id".to_owned(), "req-1".to_owned()),
+                ("x-staged".to_owned(), "drop-me".to_owned()),
+            ])
+            // The transform runs last: it drops the staged header and appends a
+            // marker, proving it has the final say over the assembled list.
+            .with_transform_headers(|mut headers| {
+                headers.retain(|(k, _)| k != "x-staged");
+                headers.push(("x-transformed".to_owned(), "yes".to_owned()));
+                headers
+            });
+        provider.complete(&ctx, &opts).await.unwrap();
+
+        let sent = mock.last_request();
+        // Auth and both surviving caller headers reached the wire.
+        assert!(
+            sent.headers
+                .iter()
+                .any(|(k, v)| k == "x-api-key" && v == "sk-secret")
+        );
+        // The staged header was dropped by the transform.
+        assert!(!sent.headers.iter().any(|(k, _)| k == "x-staged"));
+
+        // The assembly order holds on the wire: construction-time header, then
+        // the per-request static header, then the transform's addition.
+        let index = |name: &str| {
+            sent.headers.iter().position(|(k, _)| k == name).unwrap()
+        };
+        assert!(index("x-tenant") < index("x-request-id"));
+        assert!(index("x-request-id") < index("x-transformed"));
+        assert_eq!(sent.headers[index("x-request-id")].1, "req-1".to_owned());
+        assert_eq!(sent.headers[index("x-transformed")].1, "yes".to_owned());
+    }
+
+    #[test]
+    fn debug_renders_the_transform_as_present_or_absent() {
+        let absent = format!("{:?}", CompletionOptions::default());
+        assert!(absent.contains("transform_headers: \"<absent>\""));
+
+        let present = format!(
+            "{:?}",
+            CompletionOptions::default().with_transform_headers(|h| h)
+        );
+        assert!(present.contains("transform_headers: \"<present>\""));
     }
 
     #[test]

@@ -12,7 +12,18 @@
 
 use crate::message::Message;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::ops::Deref;
+use std::sync::Arc;
+
+/// A caller-supplied final rewrite of a request's fully-assembled headers.
+///
+/// It takes the assembled headers by value and returns the headers to send,
+/// so it can add, drop, reorder, or dedup entries as it sees fit. Applied last,
+/// after auth, construction-time, and per-request static headers. Sync, so it
+/// runs inline while a request is built.
+pub type HeaderTransform =
+    Arc<dyn Fn(Vec<(String, String)>) -> Vec<(String, String)> + Send + Sync>;
 
 /// Instructions that steer the model, sent out of band from the messages.
 ///
@@ -216,7 +227,13 @@ impl Context {
 /// These describe how to sample, not what the conversation is: the sampling
 /// temperature, the output-token cap, and the tool choice. Passed alongside a
 /// [`Context`], so one set of options can drive several turns.
-#[derive(Debug, Clone, PartialEq, Default)]
+///
+/// The [`transform_headers`](Self::transform_headers) field holds an
+/// `Arc<dyn Fn>`, which cannot derive `PartialEq` or `Debug`. Following the
+/// [`ResolvedAuth`](crate::ResolvedAuth) precedent (ADR-0009), `PartialEq` is
+/// dropped and `Debug` is written by hand, rendering the transform as present or
+/// absent; `Clone` and `Default` stay derived.
+#[derive(Clone, Default)]
 pub struct CompletionOptions {
     /// Sampling temperature; `None` leaves the Provider default.
     pub temperature: Option<f32>,
@@ -233,6 +250,36 @@ pub struct CompletionOptions {
     /// Credential in force; a set value always wins and is sent on the
     /// Provider's api-key lane.
     pub api_key: Option<String>,
+    /// Static headers appended to this one request, after auth and
+    /// construction-time headers. They are appended, not merged: a name already
+    /// present rides alongside as a second entry, so an HTTP server that takes
+    /// the last value sees the per-request one win. Collapsing duplicates is the
+    /// [`transform_headers`](Self::transform_headers) job.
+    pub headers: Vec<(String, String)>,
+    /// A caller-supplied final rewrite of the request's assembled headers,
+    /// applied after [`headers`](Self::headers). `None` leaves the assembled
+    /// headers untouched.
+    pub transform_headers: Option<HeaderTransform>,
+}
+
+impl fmt::Debug for CompletionOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionOptions")
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("tool_choice", &self.tool_choice)
+            .field("thinking", &self.thinking)
+            .field("api_key", &self.api_key)
+            .field("headers", &self.headers)
+            .field(
+                "transform_headers",
+                match self.transform_headers {
+                    Some(_) => &"<present>",
+                    None => &"<absent>",
+                },
+            )
+            .finish()
+    }
 }
 
 impl CompletionOptions {
@@ -270,6 +317,48 @@ impl CompletionOptions {
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
+    }
+
+    /// Set the static headers added to this one request.
+    #[must_use]
+    pub fn with_headers(
+        mut self,
+        headers: impl Into<Vec<(String, String)>>,
+    ) -> Self {
+        self.headers = headers.into();
+        self
+    }
+
+    /// Set the [`HeaderTransform`] that rewrites the request's assembled headers.
+    #[must_use]
+    pub fn with_transform_headers<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Vec<(String, String)>) -> Vec<(String, String)>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.transform_headers = Some(Arc::new(f));
+        self
+    }
+
+    /// Finish a request's headers: append the per-request
+    /// [`headers`](Self::headers) to `base`, then apply the
+    /// [`transform_headers`](Self::transform_headers) if one is set.
+    ///
+    /// A Provider builds its `auth + extra_headers` base, calls this, then folds
+    /// the result onto the wire, so every Provider shares one assembly order and
+    /// the transform has the final say.
+    #[must_use]
+    pub fn finalize_headers(
+        &self,
+        mut base: Vec<(String, String)>,
+    ) -> Vec<(String, String)> {
+        base.extend(self.headers.iter().cloned());
+        match &self.transform_headers {
+            Some(transform) => transform(base),
+            None => base,
+        }
     }
 }
 

@@ -96,9 +96,17 @@ _Avoid_: Conversation, session, prompt, request.
 
 **Completion Options**:
 The per-request knobs that steer generation rather than describe the conversation:
-sampling temperature, output-token cap, tool choice, and Thinking Level. Passed
-alongside the Context.
+sampling temperature, output-token cap, tool choice, and Thinking Level. It also
+carries the request's per-request headers and its Header Transform. Passed alongside
+the Context.
 _Avoid_: Config, settings, params.
+
+**Header Transform**:
+A caller-supplied final rewrite of a request's assembled headers, carried on the
+Completion Options and applied after auth, construction-time, and per-request static
+headers. Takes the headers by value and returns the headers to send, so it can add,
+drop, reorder, or dedup entries; it has the final say over the wire.
+_Avoid_: Header hook, header filter, interceptor, middleware.
 
 **Thinking Level**:
 How hard the model is asked to reason before answering, as a Provider-neutral effort

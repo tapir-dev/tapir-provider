@@ -89,6 +89,10 @@ required-features = ["models-fetch", "openai", "anthropic"]
 name = "provider_factories"
 required-features = ["anthropic", "openai"]
 
+[[example]]
+name = "transform_request_headers"
+required-features = ["anthropic"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

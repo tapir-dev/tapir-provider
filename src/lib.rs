@@ -95,8 +95,8 @@ pub use model::{ModelId, ProviderId};
 pub use provider::Provider;
 pub use registry::{ProviderInfo, Registry};
 pub use request::{
-    CompletionOptions, Context, SystemPrompt, ThinkingLevel, ToolChoice,
-    ToolDefinition,
+    CompletionOptions, Context, HeaderTransform, SystemPrompt, ThinkingLevel,
+    ToolChoice, ToolDefinition,
 };
 pub use response::{FinishReason, Usage};
 pub use retry::{Clock, RetryPolicy, RetryProvider, SystemClock};
