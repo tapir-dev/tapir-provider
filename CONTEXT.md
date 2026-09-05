@@ -145,10 +145,31 @@ on the settled reply. It may carry an opaque signature that lets the reasoning b
 replayed to the Provider on a later turn.
 _Avoid_: Reasoning trace, chain of thought, scratchpad.
 
+**Wire Adapter**:
+What a Provider must supply on the wire, factored out of the shared completion flow:
+its buffered response type and Stream Normalizer, the endpoint path, the auth headers a
+Credential produces, the request body, the mapping into an Assistant Message, a fresh
+Stream Normalizer, and a defaulted no-op header-augmentation hook. It is the only part
+that varies by Provider; the invariant flow — build, send, the success gate and error
+classification, the double-decode, and the stream-driver wrap — lives in the Completion
+Pipeline that holds an adapter and the shared Provider fields.
+_Avoid_: Wire client, codec, backend adapter.
+
+**Completion Pipeline**:
+The shared completion flow a Provider is built from: it holds the Provider fields every
+backend carries — the transport, the Credential, the Model, the base URL, and the extra
+headers — plus one Wire Adapter, and implements the Provider trait once for all of them.
+It owns the invariant steps around the adapter: build the request, send, gate on success
+with the error classification, double-decode into an Assistant Message, and wrap the byte
+stream in the shared stream driver. It also carries the Streaming on/off signal, so no
+adapter re-decides it.
+_Avoid_: Runner, engine, request loop, orchestrator.
+
 **Stream Normalizer**:
-The per-Provider seam that maps one decoded SSE event into the Provider-neutral stream
-vocabulary — the ordered Stream Events a streamed completion surfaces — threading the
-little state the mapping needs across events. It is the only part of the streaming
-pipeline that varies by Provider; reassembling events off the byte chunks, buffering
-what one chunk expands into, and propagating transport errors are shared behind it.
+The streaming half of a Wire Adapter: it maps one decoded SSE event into the
+Provider-neutral stream vocabulary — the ordered Stream Events a streamed completion
+surfaces — threading the little state the mapping needs across events. It is the only
+part of the streaming pipeline that varies by Provider; reassembling events off the byte
+chunks, buffering what one chunk expands into, and propagating transport errors are
+shared behind it.
 _Avoid_: Parser, decoder (the SSE decoder is a separate, shared concern), event mapper.
