@@ -77,6 +77,15 @@ pub(super) fn bearer(credential: &Credential) -> String {
     format!("Bearer {token}")
 }
 
+/// The auth headers a request authenticating with `credential` carries.
+///
+/// OpenAI's whole auth scheme is one `Authorization: Bearer` header. Both the
+/// request path and the Model Registry's auth inspection go through this, so
+/// what one reports is exactly what the other sends.
+pub(crate) fn auth_headers(credential: &Credential) -> Vec<(String, String)> {
+    vec![("authorization".to_owned(), bearer(credential))]
+}
+
 /// A Provider for OpenAI's Chat Completions API.
 ///
 /// The transport is injected as the generic `H`, which erases to
@@ -215,6 +224,13 @@ impl<H: HttpClient> OpenAIProvider<H> {
         opts: &CompletionOptions,
         streaming: Streaming,
     ) -> Result<HttpRequest, Error> {
+        // An explicit per-request key overrides the constructed Credential for
+        // this call.
+        let override_credential =
+            opts.api_key.as_deref().map(Credential::api_key);
+        let credential =
+            override_credential.as_ref().unwrap_or(&self.credential);
+
         let body = serde_json::to_vec(&WireRequest::from_context(
             &self.model,
             ctx,
@@ -228,8 +244,12 @@ impl<H: HttpClient> OpenAIProvider<H> {
             self.base_url.trim_end_matches('/')
         );
         let request = HttpRequest::new(Method::Post, url)
-            .header("content-type", "application/json")
-            .header("authorization", bearer(&self.credential));
+            .header("content-type", "application/json");
+        // Auth headers come from the one scheme definition, so the wire matches
+        // what auth inspection reports.
+        let request = auth_headers(credential)
+            .into_iter()
+            .fold(request, |req, (name, value)| req.header(name, value));
         // Caller headers ride last, so a proxy or gateway can key off them.
         let request = self
             .extra_headers
@@ -445,6 +465,9 @@ struct StreamNormalizer {
     finish_reason: Option<FinishReason>,
     /// Running token usage, reported in the trailing usage chunk.
     usage: Usage,
+    /// Text indices that have already opened, so the first fragment brackets the
+    /// block with a [`StreamEvent::TextStart`] and the stream end closes it.
+    text_started: Vec<usize>,
     /// Tool-call indices that have already opened, so a later argument fragment
     /// does not re-emit a [`StreamEvent::ToolCallStart`].
     tool_started: Vec<usize>,
@@ -456,7 +479,12 @@ impl StreamNormalizer {
         // The sentinel that terminates every OpenAI stream.
         if sse.data.trim() == "[DONE]" {
             let mut events = Vec::new();
-            // Close any tool calls that opened, in index order, before the end.
+            // Close any text and tool blocks that opened, in index order,
+            // before the end.
+            self.text_started.sort_unstable();
+            for index in self.text_started.drain(..) {
+                events.push(StreamEvent::TextEnd { index });
+            }
             self.tool_started.sort_unstable();
             for index in self.tool_started.drain(..) {
                 events.push(StreamEvent::ToolCallEnd { index });
@@ -495,6 +523,10 @@ impl StreamNormalizer {
                 if let Some(text) = delta["content"].as_str()
                     && !text.is_empty()
                 {
+                    if !self.text_started.contains(&index) {
+                        self.text_started.push(index);
+                        events.push(StreamEvent::TextStart { index });
+                    }
                     events.push(StreamEvent::TextDelta {
                         index,
                         text: text.to_owned(),
@@ -604,7 +636,7 @@ impl<'a> WireRequest<'a> {
         // the conversation follows in order.
         let mut messages = Vec::with_capacity(ctx.messages.len() + 1);
         if let Some(system) = &ctx.system_prompt {
-            messages.push(WireMessage::system(system));
+            messages.push(WireMessage::system(system.as_str()));
         }
         messages.extend(ctx.messages.iter().map(wire_message));
 
@@ -662,6 +694,8 @@ fn wire_assistant(assistant: &AssistantMessage) -> WireMessage<'_> {
             }),
             // An assistant image is not representable on the request; skip it.
             ContentPart::Image(_) => {}
+            // OpenAI Chat has no thinking block to replay; skip it.
+            ContentPart::Thinking { .. } => {}
         }
     }
     let content = if text.is_empty() && !tool_calls.is_empty() {
@@ -826,6 +860,7 @@ fn wire_content_part(part: &ContentPart) -> Option<WireContentPart<'_>> {
             },
         }),
         ContentPart::ToolCall { .. } => None,
+        ContentPart::Thinking { .. } => None,
     }
 }
 
@@ -1079,6 +1114,34 @@ mod tests {
                 .headers
                 .iter()
                 .any(|(k, v)| k == "authorization" && v == "Bearer sk-stored")
+        );
+    }
+
+    #[tokio::test]
+    async fn per_request_api_key_overrides_the_constructed_credential() {
+        let mock =
+            Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
+        let provider = OpenAIProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-constructed"),
+            "gpt-4o-mini",
+        );
+
+        let ctx = Context::new(vec![Message::user("Hi")]);
+        let opts = opts().with_api_key("sk-explicit");
+        provider.complete(&ctx, &opts).await.unwrap();
+
+        let sent = mock.last_request();
+        assert!(
+            sent.headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == "Bearer sk-explicit")
+        );
+        assert!(
+            !sent
+                .headers
+                .iter()
+                .any(|(_, v)| v == "Bearer sk-constructed")
         );
     }
 
@@ -1349,13 +1412,16 @@ mod tests {
         let events = collect_stream(&provider).await;
 
         assert_eq!(events.first(), Some(&StreamEvent::MessageStart));
+        assert_eq!(events[1], StreamEvent::TextStart { index: 0 });
         assert_eq!(
-            events[1],
+            events[2],
             StreamEvent::TextDelta {
                 index: 0,
                 text: "Hello".to_owned()
             }
         );
+        // The synthesized text block closes before the terminal Done.
+        assert!(events.contains(&StreamEvent::TextEnd { index: 0 }));
         assert!(matches!(
             events.last(),
             Some(StreamEvent::Done {

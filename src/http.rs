@@ -182,6 +182,23 @@ impl<T: HttpClient + ?Sized> HttpClient for std::sync::Arc<T> {
     }
 }
 
+/// Forward through a shared reference so a `&H` is itself a transport, letting a
+/// caller drive a borrowed transport (for example when inspecting auth without
+/// taking ownership of the client).
+#[async_trait]
+impl<T: HttpClient + ?Sized> HttpClient for &T {
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, Error> {
+        (**self).send(request).await
+    }
+
+    async fn send_stream(
+        &self,
+        request: HttpRequest,
+    ) -> Result<ByteStream, Error> {
+        (**self).send_stream(request).await
+    }
+}
+
 #[cfg(feature = "reqwest")]
 mod reqwest_client {
     use super::{

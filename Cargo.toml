@@ -63,6 +63,32 @@ fs4 = { version = "1", default-features = false, features = [
     "sync",
 ], optional = true }
 
+# Streaming extended-thinking example; needs the catalog and the Anthropic
+# Provider, so it is skipped unless both features are on.
+[[example]]
+name = "quick_start"
+required-features = ["models", "anthropic"]
+
+# Catalog-querying example; needs the model catalog type layer.
+[[example]]
+name = "querying_models"
+required-features = ["models"]
+
+# Auth-resolution inspection example; needs the Model Registry and a Provider.
+[[example]]
+name = "auth"
+required-features = ["models", "openai"]
+
+# Live Model-list refresh example; needs the fetch layer and both Providers.
+[[example]]
+name = "dynamic_providers"
+required-features = ["models-fetch", "openai", "anthropic"]
+
+# Compiled-in Provider set example; needs both Providers.
+[[example]]
+name = "provider_factories"
+required-features = ["anthropic", "openai"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

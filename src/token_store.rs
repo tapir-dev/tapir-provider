@@ -9,8 +9,14 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::auth::AuthSource;
 use crate::credential::Credential;
 use crate::error::Error;
+
+/// Default pre-expiry window for a proactive OAuth refresh: a token is renewed
+/// once it comes within five minutes of expiring. Available regardless of which
+/// Token Store backend is compiled in.
+pub const DEFAULT_REFRESH_WINDOW_SECS: u64 = 300;
 
 /// The persistence boundary for [`Credential`]s.
 ///
@@ -88,10 +94,14 @@ pub trait Refresh: Send + Sync {
 /// non-OAuth Credential, or an OAuth token with no known expiry, is never stale
 /// — so an API key is never refreshed.
 ///
-/// Only the file-backed store's proactive refresh consults this, so it is gated
-/// on `token-store-file`.
-#[cfg(feature = "token-store-file")]
-fn needs_refresh(credential: &Credential, window_secs: u64, now: u64) -> bool {
+/// Both the file-backed store's proactive refresh and the Model Registry's
+/// refresh-on-inspect consult this, so it is available regardless of feature.
+#[cfg(any(feature = "models", feature = "token-store-file"))]
+pub(crate) fn is_stale(
+    credential: &Credential,
+    window_secs: u64,
+    now: u64,
+) -> bool {
     match credential.as_oauth().and_then(|tokens| tokens.expires_at) {
         Some(expires_at) => now.saturating_add(window_secs) >= expires_at,
         None => false,
@@ -118,6 +128,27 @@ pub fn resolve(
     resolve_with(explicit, store, provider, || std::env::var(env_var).ok())
 }
 
+/// Resolve a Provider's [`Credential`] and report which tier it came from.
+///
+/// The same precedence as [`resolve`] — explicit, then the `store`, then the
+/// `env_var` environment variable — but paired with the [`AuthSource`] that won,
+/// so a caller inspecting auth can see how a Provider is configured. A stored
+/// OAuth Credential reports [`AuthSource::OAuth`]; a stored API key reports
+/// [`AuthSource::Stored`].
+///
+/// A [`TokenStore::get`] failure propagates rather than silently falling through
+/// to the environment.
+pub fn resolve_with_source(
+    explicit: Option<Credential>,
+    store: Option<&dyn TokenStore>,
+    provider: &str,
+    env_var: &str,
+) -> Result<Option<(Credential, AuthSource)>, Error> {
+    resolve_with_source_with(explicit, store, provider, env_var, || {
+        std::env::var(env_var).ok()
+    })
+}
+
 /// The precedence rule with the environment read injected, so it can be tested
 /// without mutating the process environment (which `#![forbid(unsafe_code)]`
 /// disallows under edition 2024). [`resolve`] is the real-environment wrapper.
@@ -127,19 +158,44 @@ fn resolve_with(
     provider: &str,
     env: impl FnOnce() -> Option<String>,
 ) -> Result<Option<Credential>, Error> {
+    Ok(
+        resolve_with_source_with(explicit, store, provider, "", env)?
+            .map(|(credential, _)| credential),
+    )
+}
+
+/// [`resolve_with_source`] with the environment read injected, so tier reporting
+/// is testable without touching the process environment. `env_var` names the
+/// variable only so an environment hit can report [`AuthSource::Env`].
+fn resolve_with_source_with(
+    explicit: Option<Credential>,
+    store: Option<&dyn TokenStore>,
+    provider: &str,
+    env_var: &str,
+    env: impl FnOnce() -> Option<String>,
+) -> Result<Option<(Credential, AuthSource)>, Error> {
     if let Some(credential) = explicit {
-        return Ok(Some(credential));
+        return Ok(Some((credential, AuthSource::Explicit)));
     }
     if let Some(store) = store
         && let Some(credential) = store.get(provider)?
     {
-        return Ok(Some(credential));
+        let source = match &credential {
+            Credential::OAuth(_) => AuthSource::OAuth,
+            Credential::ApiKey { .. } => AuthSource::Stored,
+        };
+        return Ok(Some((credential, source)));
     }
-    Ok(env().map(Credential::api_key))
+    Ok(env().map(|key| {
+        (
+            Credential::api_key(key),
+            AuthSource::Env(env_var.to_owned()),
+        )
+    }))
 }
 
 #[cfg(feature = "token-store-file")]
-pub use file::{DEFAULT_REFRESH_WINDOW_SECS, FileTokenStore};
+pub use file::FileTokenStore;
 
 /// The file-backed [`TokenStore`] and its locked, double-checked proactive
 /// refresh. Gated on `token-store-file`.
@@ -153,14 +209,9 @@ mod file {
 
     use fs4::FileExt;
 
-    use super::{Refresh, TokenStore, needs_refresh};
+    use super::{Refresh, TokenStore, is_stale};
     use crate::credential::Credential;
     use crate::error::{Error, ErrorKind};
-
-    /// Default pre-expiry window for [`FileTokenStore::refresh_if_stale`]: an
-    /// OAuth token is refreshed once it comes within five minutes of expiring.
-    /// It matches the safety margin baked into a minted OAuth Credential.
-    pub const DEFAULT_REFRESH_WINDOW_SECS: u64 = 300;
 
     /// A [`TokenStore`] that persists Credentials to a TOML file, guarded by an
     /// OS advisory file lock so concurrent processes coordinate.
@@ -236,7 +287,7 @@ mod file {
             // token, and a shared read keeps concurrent readers from serializing.
             match self.get(provider)? {
                 None => return Ok(None),
-                Some(current) if !needs_refresh(&current, window_secs, now) => {
+                Some(current) if !is_stale(&current, window_secs, now) => {
                     return Ok(Some(current));
                 }
                 Some(_) => {}
@@ -277,15 +328,15 @@ mod file {
             };
             // The double check: a concurrent writer may have renewed the token
             // between the shared read and this exclusive lock.
-            if !needs_refresh(&current, window_secs, now) {
+            if !is_stale(&current, window_secs, now) {
                 return Ok(Some(current));
             }
 
-            // needs_refresh only returns true for an OAuth Credential, so the
+            // is_stale only returns true for an OAuth Credential, so the
             // refresh token is present.
             let refresh_token = current
                 .as_oauth()
-                .expect("needs_refresh implies an OAuth Credential")
+                .expect("is_stale implies an OAuth Credential")
                 .refresh_token
                 .clone();
             let renewed = refresher.refresh(&refresh_token).await?;
@@ -512,6 +563,73 @@ mod tests {
             resolve_with(None, None, "anthropic", env_absent).unwrap();
         assert!(resolved.is_none());
     }
+
+    #[test]
+    fn source_reports_the_winning_tier() {
+        let store = InMemoryTokenStore::new();
+        store
+            .set("anthropic", Credential::api_key("from-store"))
+            .unwrap();
+
+        // Explicit wins and reports Explicit.
+        let (_, source) = resolve_with_source_with(
+            Some(Credential::api_key("explicit")),
+            Some(&store),
+            "anthropic",
+            "ANTHROPIC_API_KEY",
+            env_present,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source, AuthSource::Explicit);
+
+        // A stored API key reports Stored.
+        let (_, source) = resolve_with_source_with(
+            None,
+            Some(&store),
+            "anthropic",
+            "ANTHROPIC_API_KEY",
+            env_present,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source, AuthSource::Stored);
+
+        // The environment reports the variable name.
+        let empty = InMemoryTokenStore::new();
+        let (_, source) = resolve_with_source_with(
+            None,
+            Some(&empty),
+            "anthropic",
+            "ANTHROPIC_API_KEY",
+            env_present,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source, AuthSource::Env("ANTHROPIC_API_KEY".to_owned()));
+    }
+
+    #[test]
+    fn a_stored_oauth_credential_reports_oauth() {
+        use crate::credential::OAuthTokens;
+        let store = InMemoryTokenStore::new();
+        store
+            .set(
+                "anthropic",
+                Credential::oauth(OAuthTokens::new("acc", "ref", Some(1))),
+            )
+            .unwrap();
+        let (_, source) = resolve_with_source_with(
+            None,
+            Some(&store),
+            "anthropic",
+            "ANTHROPIC_API_KEY",
+            env_absent,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source, AuthSource::OAuth);
+    }
 }
 
 #[cfg(all(test, feature = "token-store-file"))]
@@ -526,25 +644,25 @@ mod refresh_tests {
     #[test]
     fn non_oauth_is_never_stale() {
         // An API key has no expiry to reason about; it must never be refreshed.
-        assert!(!needs_refresh(&Credential::api_key("sk"), 300, 1_000));
+        assert!(!is_stale(&Credential::api_key("sk"), 300, 1_000));
     }
 
     #[test]
     fn oauth_without_expiry_is_never_stale() {
-        assert!(!needs_refresh(&oauth(None), 300, u64::MAX));
+        assert!(!is_stale(&oauth(None), 300, u64::MAX));
     }
 
     #[test]
     fn oauth_within_the_window_is_stale() {
         // Expires at 1000; with a 300s window, now=800 lands inside it.
-        assert!(needs_refresh(&oauth(Some(1_000)), 300, 800));
+        assert!(is_stale(&oauth(Some(1_000)), 300, 800));
         // Exactly at the window edge counts as stale.
-        assert!(needs_refresh(&oauth(Some(1_000)), 300, 700));
+        assert!(is_stale(&oauth(Some(1_000)), 300, 700));
     }
 
     #[test]
     fn oauth_outside_the_window_is_fresh() {
-        assert!(!needs_refresh(&oauth(Some(1_000)), 300, 699));
+        assert!(!is_stale(&oauth(Some(1_000)), 300, 699));
     }
 }
 

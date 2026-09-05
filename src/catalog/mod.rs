@@ -33,6 +33,7 @@ pub use user_config::default_path as user_config_path;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::auth::ResolvedAuth;
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
 use crate::http::HttpClient;
@@ -44,11 +45,26 @@ use crate::token_store::{self, TokenStore};
 /// The runtime holder of the Catalog.
 ///
 /// It owns the merged, Credential-resolved [`ModelEntry`]s and answers lookups
-/// over them. See the [module docs](self) for the layering model.
-#[derive(Debug, Clone, PartialEq)]
+/// over them. See the [module docs](self) for the layering model. It also
+/// retains the Token Store passed to [`load`](Self::load) so it can inspect and
+/// refresh auth on demand ([`get_auth`](Self::get_auth)).
+#[derive(Clone)]
 pub struct ModelRegistry {
     entries: Vec<ModelEntry>,
     models_path: Option<PathBuf>,
+    auth: Option<Arc<dyn TokenStore>>,
+}
+
+/// Omits the retained Token Store (not `Debug`, and a secret holder) while
+/// keeping the Catalog shape visible.
+impl std::fmt::Debug for ModelRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelRegistry")
+            .field("entries", &self.entries)
+            .field("models_path", &self.models_path)
+            .field("auth", &self.auth.as_ref().map(|_| "<store>"))
+            .finish()
+    }
 }
 
 impl ModelRegistry {
@@ -80,7 +96,7 @@ impl ModelRegistry {
     /// an aliased or duplicate Provider key, or a new Model missing a required
     /// field. Without that feature, or with no user file, `load` never fails.
     pub fn load(
-        auth: Option<&dyn TokenStore>,
+        auth: Option<Arc<dyn TokenStore>>,
         models_path: Option<PathBuf>,
     ) -> Result<Self, Error> {
         let mut entries = baseline::entries();
@@ -100,12 +116,143 @@ impl ModelRegistry {
             if entry.api_key.is_some() {
                 continue;
             }
-            entry.api_key = resolve_api_key(entry, auth);
+            entry.api_key = resolve_api_key(entry, auth.as_deref());
         }
         Ok(Self {
             entries,
             models_path,
+            auth,
         })
+    }
+
+    /// Inspect how a Provider would authenticate right now, without making a
+    /// request.
+    ///
+    /// Resolves the Provider's Credential by the usual precedence — the retained
+    /// Token Store under the Provider's id, then its API-key environment
+    /// variable — and reports the [`ResolvedAuth`]: the [`AuthSource`](crate::AuthSource)
+    /// tier that won, the auth headers a request would carry, and an
+    /// auth-derived API key. A stale stored OAuth token is refreshed over
+    /// `transport` first and the renewal persisted through the Store.
+    ///
+    /// `Ok(None)` means the Provider is not configured (no Credential anywhere,
+    /// or no such Provider compiled in) — the inspection's "not configured".
+    ///
+    /// # Errors
+    ///
+    /// [`Authentication`](crate::ErrorKind::Authentication) when the Token Store
+    /// read fails, or when an OAuth refresh was required and failed (the stored
+    /// Credential is preserved for re-login, never overwritten or dropped).
+    pub async fn get_auth<H: HttpClient>(
+        &self,
+        provider: &str,
+        transport: &H,
+    ) -> Result<Option<ResolvedAuth>, Error> {
+        self.resolve_auth(provider, None, transport).await
+    }
+
+    /// Inspect how a Model would authenticate right now, layering the Model's own
+    /// headers and base URL over its Provider's [`get_auth`](Self::get_auth).
+    ///
+    /// Same resolution as [`get_auth`](Self::get_auth) for the entry's Provider,
+    /// then the entry's [`headers`](crate::Model::headers) are appended after the
+    /// auth headers and its [`base_url`](crate::Model::base_url) is reported.
+    ///
+    /// # Errors
+    ///
+    /// As [`get_auth`](Self::get_auth).
+    pub async fn get_auth_for<H: HttpClient>(
+        &self,
+        entry: &ModelEntry,
+        transport: &H,
+    ) -> Result<Option<ResolvedAuth>, Error> {
+        self.resolve_auth(entry.model.provider.as_str(), Some(entry), transport)
+            .await
+    }
+
+    /// The shared body of the two inspections: resolve the Provider's Credential,
+    /// refresh stale OAuth, build the [`ResolvedAuth`], and layer a Model when one
+    /// is given.
+    async fn resolve_auth<H: HttpClient>(
+        &self,
+        provider: &str,
+        model: Option<&ModelEntry>,
+        transport: &H,
+    ) -> Result<Option<ResolvedAuth>, Error> {
+        // An unknown Provider is "not configured", not an error.
+        let Some(info) = Registry::resolve(provider) else {
+            return Ok(None);
+        };
+        let id = info.id.as_str();
+        let Some((credential, source)) = token_store::resolve_with_source(
+            None,
+            self.auth.as_deref(),
+            id,
+            info.api_key_env,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let credential = self.maybe_refresh(id, credential, transport).await?;
+        let mut headers =
+            provider_auth_headers(id, &credential).unwrap_or_default();
+        let api_key = credential.as_api_key().map(str::to_owned);
+        let base_url = model.map(|entry| entry.model.base_url.clone());
+        if let Some(entry) = model {
+            headers.extend(entry.model.headers.iter().cloned());
+        }
+
+        Ok(Some(ResolvedAuth {
+            source,
+            headers,
+            api_key,
+            base_url,
+        }))
+    }
+
+    /// Refresh a stale stored OAuth Credential over `transport`, persisting the
+    /// renewal through the Store; return the Credential now in force.
+    ///
+    /// A non-OAuth Credential, a fresh one, an OAuth token with no known expiry,
+    /// or a Provider with no OAuth flow is returned untouched. A refresh failure
+    /// is an [`Authentication`](crate::ErrorKind::Authentication) error and never
+    /// disturbs the stored Credential.
+    async fn maybe_refresh<H: HttpClient>(
+        &self,
+        provider_id: &str,
+        credential: Credential,
+        transport: &H,
+    ) -> Result<Credential, Error> {
+        let Some(tokens) = credential.as_oauth() else {
+            return Ok(credential);
+        };
+        if !token_store::is_stale(
+            &credential,
+            token_store::DEFAULT_REFRESH_WINDOW_SECS,
+            now_unix(),
+        ) {
+            return Ok(credential);
+        }
+        // No Store to persist a renewal through, or no Provider OAuth flow to do
+        // it: report the stored token as-is.
+        let Some(store) = self.auth.as_deref() else {
+            return Ok(credential);
+        };
+        let refresh_token = tokens.refresh_token.clone();
+        match provider_refresh(provider_id, &refresh_token, transport).await {
+            Ok(Some(renewed)) => {
+                store.set(provider_id, renewed.clone())?;
+                Ok(renewed)
+            }
+            Ok(None) => Ok(credential),
+            Err(err) => Err(Error::new(
+                ErrorKind::Authentication,
+                format!(
+                    "OAuth token refresh failed for {provider_id:?}; stored credential preserved for re-login: {err}"
+                ),
+            )),
+        }
     }
 
     /// Every entry in the Catalog, whether or not it has a resolved Credential.
@@ -262,6 +409,59 @@ fn resolve_api_key(
         Ok(Some(Credential::ApiKey { key, .. })) => Some(key),
         _ => None,
     }
+}
+
+/// The auth headers a Provider would send for `credential`, or `None` when no
+/// adapter for `provider_id` is compiled into this build.
+///
+/// Dispatches by the same compiled-in arms as [`create_provider`], so the
+/// headers auth inspection reports are exactly what the Provider sends.
+fn provider_auth_headers(
+    provider_id: &str,
+    credential: &Credential,
+) -> Option<Vec<(String, String)>> {
+    #[cfg(feature = "anthropic")]
+    if provider_id == crate::providers::anthropic::INFO.id.as_str() {
+        return Some(crate::providers::anthropic::auth_headers(credential));
+    }
+    #[cfg(feature = "openai")]
+    if provider_id == crate::providers::openai::INFO.id.as_str() {
+        return Some(crate::providers::openai::auth_headers(credential));
+    }
+    let _ = credential;
+    None
+}
+
+/// Renew an OAuth Credential through a Provider's own OAuth flow over
+/// `transport`, or `None` when the Provider has no such flow compiled in.
+///
+/// # Errors
+///
+/// Whatever the flow's refresh reports: a transport failure, a non-2xx
+/// token-endpoint response, or an undecodable body.
+#[allow(unused_variables)]
+async fn provider_refresh<H: HttpClient>(
+    provider_id: &str,
+    refresh_token: &str,
+    transport: &H,
+) -> Result<Option<Credential>, Error> {
+    #[cfg(feature = "anthropic")]
+    if provider_id == crate::providers::anthropic::INFO.id.as_str() {
+        let flow =
+            crate::providers::anthropic::oauth::AnthropicOAuth::new(transport);
+        let renewed =
+            crate::token_store::Refresh::refresh(&flow, refresh_token).await?;
+        return Ok(Some(renewed));
+    }
+    Ok(None)
+}
+
+/// Current Unix time in seconds, or 0 if the clock predates the epoch.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Turn a [`ModelEntry`] into a live Provider over the injected `transport`.
@@ -474,11 +674,11 @@ mod openai_tests {
 
     #[test]
     fn a_resolved_key_makes_a_model_available() {
-        let store = InMemoryTokenStore::new();
+        let store = Arc::new(InMemoryTokenStore::new());
         store
             .set("openai", Credential::api_key("sk-openai"))
             .unwrap();
-        let registry = ModelRegistry::load(Some(&store), None).unwrap();
+        let registry = ModelRegistry::load(Some(store.clone()), None).unwrap();
 
         let available = registry.available_models();
         assert!(
@@ -510,11 +710,11 @@ mod openai_build_tests {
 
     #[tokio::test]
     async fn create_provider_is_the_one_call_common_path() {
-        let store = InMemoryTokenStore::new();
+        let store = Arc::new(InMemoryTokenStore::new());
         store
             .set("openai", Credential::api_key("sk-openai"))
             .unwrap();
-        let registry = ModelRegistry::load(Some(&store), None).unwrap();
+        let registry = ModelRegistry::load(Some(store.clone()), None).unwrap();
         let http =
             Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
 
@@ -624,8 +824,8 @@ mod fetch_tests {
         }
     }
 
-    fn openai_store() -> InMemoryTokenStore {
-        let store = InMemoryTokenStore::new();
+    fn openai_store() -> Arc<InMemoryTokenStore> {
+        let store = Arc::new(InMemoryTokenStore::new());
         store
             .set("openai", Credential::api_key("sk-openai"))
             .unwrap();
@@ -640,7 +840,8 @@ mod fetch_tests {
         // Record a refresh: the fetch flows through the VCR record path against a
         // fake upstream, populating the fetched layer and writing the cache.
         let mut registry =
-            ModelRegistry::load(Some(&store), Some(dir.models_path())).unwrap();
+            ModelRegistry::load(Some(store.clone()), Some(dir.models_path()))
+                .unwrap();
         assert!(registry.find("openai", "gpt-fetched-model").is_none());
         let recorder = VcrClient::new(
             MockHttpClient::with_response(200, MODELS_RESPONSE),
@@ -666,7 +867,8 @@ mod fetch_tests {
         // A fresh load reads the fetched layer straight from the on-disk cache,
         // with no network at all.
         let reloaded =
-            ModelRegistry::load(Some(&store), Some(dir.models_path())).unwrap();
+            ModelRegistry::load(Some(store.clone()), Some(dir.models_path()))
+                .unwrap();
         assert!(reloaded.find("openai", "gpt-fetched-model").is_some());
     }
 
@@ -677,7 +879,8 @@ mod fetch_tests {
 
         // Record once so the cassette exists.
         let mut recording =
-            ModelRegistry::load(Some(&store), Some(dir.models_path())).unwrap();
+            ModelRegistry::load(Some(store.clone()), Some(dir.models_path()))
+                .unwrap();
         let recorder = VcrClient::new(
             MockHttpClient::with_response(200, MODELS_RESPONSE),
             dir.cassette(),
@@ -689,7 +892,8 @@ mod fetch_tests {
         // Replay against a transport that panics if contacted: the refresh is
         // served entirely from the cassette.
         let mut registry =
-            ModelRegistry::load(Some(&store), Some(dir.models_path())).unwrap();
+            ModelRegistry::load(Some(store.clone()), Some(dir.models_path()))
+                .unwrap();
         let replayer = VcrClient::new(
             MockHttpClient::new(),
             dir.cassette(),
@@ -725,5 +929,132 @@ mod empty_tests {
         let registry = ModelRegistry::load(None, None).unwrap();
         assert!(registry.models().is_empty());
         assert!(registry.find_by_id("gpt-4o-mini").is_none());
+    }
+}
+
+// Auth inspection over the Catalog: the request-free `get_auth`/`get_auth_for`
+// path reports the resolved source, headers, and key. Needs a Provider to have a
+// baseline; `openai` supplies one, and a transport that panics if contacted
+// proves the inspection makes no request.
+#[cfg(all(test, feature = "openai", feature = "test-utils"))]
+mod auth_tests {
+    use super::*;
+    use crate::auth::AuthSource;
+    use crate::http::MockHttpClient;
+    use crate::token_store::InMemoryTokenStore;
+
+    #[tokio::test]
+    async fn get_auth_reports_a_stored_key_without_a_request() {
+        let store = Arc::new(InMemoryTokenStore::new());
+        store
+            .set("openai", Credential::api_key("sk-openai"))
+            .unwrap();
+        let registry = ModelRegistry::load(Some(store.clone()), None).unwrap();
+        // A transport that panics if contacted: inspection makes no request.
+        let http = MockHttpClient::new();
+
+        let auth = registry.get_auth("openai", &http).await.unwrap().unwrap();
+        assert_eq!(auth.source, AuthSource::Stored);
+        assert_eq!(auth.api_key.as_deref(), Some("sk-openai"));
+        // Provider-scoped: no Model, so no base URL.
+        assert!(auth.base_url.is_none());
+        assert!(
+            auth.headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == "Bearer sk-openai")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_auth_for_layers_model_headers_and_base_url() {
+        let store = Arc::new(InMemoryTokenStore::new());
+        store
+            .set("openai", Credential::api_key("sk-openai"))
+            .unwrap();
+        let registry = ModelRegistry::load(Some(store.clone()), None).unwrap();
+        let entry = registry.find("openai", "gpt-4o-mini").unwrap().clone();
+        let http = MockHttpClient::new();
+
+        let auth = registry.get_auth_for(&entry, &http).await.unwrap().unwrap();
+        // Model-scoped reports the entry's base URL...
+        assert_eq!(
+            auth.base_url.as_deref(),
+            Some(entry.model.base_url.as_str())
+        );
+        // ...the auth header is present...
+        assert!(auth.headers.iter().any(|(k, _)| k == "authorization"));
+        // ...and every Model header is layered in after it.
+        for (name, value) in &entry.model.headers {
+            assert!(auth.headers.iter().any(|(k, v)| k == name && v == value));
+        }
+    }
+
+    #[tokio::test]
+    async fn get_auth_on_an_unknown_provider_is_none() {
+        let registry = ModelRegistry::load(None, None).unwrap();
+        let http = MockHttpClient::new();
+        assert!(
+            registry
+                .get_auth("does-not-exist", &http)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+// OAuth refresh-on-inspect: a stale stored OAuth token is renewed over the
+// transport and persisted before `get_auth` reports it. Needs Anthropic's OAuth
+// flow, so it is gated on `anthropic`.
+#[cfg(all(test, feature = "anthropic", feature = "test-utils"))]
+mod oauth_refresh_tests {
+    use super::*;
+    use crate::auth::AuthSource;
+    use crate::credential::OAuthTokens;
+    use crate::http::MockHttpClient;
+    use crate::token_store::{InMemoryTokenStore, TokenStore};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TOKEN_BODY: &str = r#"{"token_type":"Bearer","access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#;
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[tokio::test]
+    async fn get_auth_refreshes_a_stale_oauth_token_and_persists_it() {
+        let store = Arc::new(InMemoryTokenStore::new());
+        // Expires now: stale within any positive window.
+        store
+            .set(
+                "anthropic",
+                Credential::oauth(OAuthTokens::new(
+                    "old-access",
+                    "old-refresh",
+                    Some(now_secs()),
+                )),
+            )
+            .unwrap();
+        let registry = ModelRegistry::load(Some(store.clone()), None).unwrap();
+        let http = Arc::new(MockHttpClient::with_response(200, TOKEN_BODY));
+
+        let auth = registry
+            .get_auth("anthropic", &http)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth.source, AuthSource::OAuth);
+        // The refreshed Bearer reached the reported headers...
+        assert!(
+            auth.headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == "Bearer new-access")
+        );
+        // ...and the renewal was persisted through the store.
+        let stored = store.get("anthropic").unwrap().unwrap();
+        assert_eq!(stored.as_oauth().unwrap().access_token, "new-access");
     }
 }

@@ -37,6 +37,11 @@ pub type StreamEvents = Pin<
 pub enum StreamEvent {
     /// The message has begun; no content has arrived yet.
     MessageStart,
+    /// A text block has opened at `index`; its deltas follow.
+    TextStart {
+        /// The content block that opened.
+        index: usize,
+    },
     /// A run of generated text for the block at `index`.
     TextDelta {
         /// The content block this delta extends.
@@ -44,12 +49,30 @@ pub enum StreamEvent {
         /// The text fragment.
         text: String,
     },
+    /// The text block at `index` is complete.
+    TextEnd {
+        /// The content block that finished.
+        index: usize,
+    },
+    /// A thinking block has opened at `index`; its deltas follow.
+    ThinkingStart {
+        /// The content block that opened.
+        index: usize,
+    },
     /// A run of model reasoning ("thinking") for the block at `index`.
-    ReasoningDelta {
+    ThinkingDelta {
         /// The content block this delta extends.
         index: usize,
         /// The reasoning fragment.
         text: String,
+    },
+    /// The thinking block at `index` is complete, carrying the Provider's
+    /// replay signature when one was supplied.
+    ThinkingEnd {
+        /// The content block that finished.
+        index: usize,
+        /// The opaque signature for replaying this reasoning, if any.
+        signature: Option<String>,
     },
     /// A tool call has begun at `index`, with its id and tool name.
     ToolCallStart {
@@ -102,16 +125,19 @@ struct PartialToolCall {
 
 /// Folds a stream of [`StreamEvent`]s into an [`AssistantMessage`].
 ///
-/// The accumulator is Provider-neutral: it concatenates text deltas per content
-/// block, reassembles tool-call fragments keyed by content index, tracks the
-/// running usage, and records the finish reason from the terminal
-/// [`StreamEvent::Done`]. Content parts (text and tool calls) are emitted in
-/// `index` order, matching the non-streaming path. Reasoning events do not
-/// contribute to the settled message, mirroring the non-streaming shape.
+/// The accumulator is Provider-neutral: it concatenates text and thinking deltas
+/// per content block, reassembles tool-call fragments keyed by content index,
+/// tracks the running usage, and records the finish reason from the terminal
+/// [`StreamEvent::Done`]. Content parts (text, thinking, and tool calls) are
+/// emitted in `index` order, matching the non-streaming path.
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
     /// Text accumulated per content-block index, kept ordered by index.
     text: BTreeMap<usize, String>,
+    /// Thinking accumulated per content-block index, kept ordered by index.
+    thinking: BTreeMap<usize, String>,
+    /// Replay signatures for thinking blocks, keyed by content-block index.
+    thinking_signatures: BTreeMap<usize, String>,
     /// Tool calls being reassembled, keyed and ordered by content-block index.
     tool_calls: BTreeMap<usize, PartialToolCall>,
     /// The most recent usage seen, from a `Usage` or `Done` event.
@@ -132,6 +158,15 @@ impl StreamAccumulator {
         match event {
             StreamEvent::TextDelta { index, text } => {
                 self.text.entry(*index).or_default().push_str(text);
+            }
+            StreamEvent::ThinkingDelta { index, text } => {
+                self.thinking.entry(*index).or_default().push_str(text);
+            }
+            StreamEvent::ThinkingEnd {
+                index,
+                signature: Some(signature),
+            } => {
+                self.thinking_signatures.insert(*index, signature.clone());
             }
             StreamEvent::ToolCallStart { index, id, name } => {
                 let call = self.tool_calls.entry(*index).or_default();
@@ -156,8 +191,9 @@ impl StreamAccumulator {
                 self.usage = *usage;
                 self.finish_reason = Some(finish_reason.clone());
             }
-            // MessageStart, reasoning, ToolCallEnd, and unknown payloads carry
-            // nothing the folded completion needs beyond what is handled above.
+            // MessageStart, the *Start/*End brackets, ToolCallEnd, and unknown
+            // payloads carry nothing the folded completion needs beyond what is
+            // handled above.
             _ => {}
         }
     }
@@ -182,11 +218,21 @@ impl StreamAccumulator {
     /// same placeholder the non-streaming path uses for a missing stop reason.
     #[must_use]
     pub fn finish(self) -> AssistantMessage {
-        // Merge text and tool-call blocks into one index-ordered part list, so
-        // the settled content matches the order the blocks streamed in.
+        // Merge text, thinking, and tool-call blocks into one index-ordered part
+        // list, so the settled content matches the order the blocks streamed in.
         let mut parts: BTreeMap<usize, ContentPart> = BTreeMap::new();
         for (index, text) in self.text {
             parts.insert(index, ContentPart::Text(text));
+        }
+        let mut signatures = self.thinking_signatures;
+        for (index, text) in self.thinking {
+            parts.insert(
+                index,
+                ContentPart::Thinking {
+                    text,
+                    signature: signatures.remove(&index),
+                },
+            );
         }
         for (index, call) in self.tool_calls {
             parts.insert(
@@ -294,11 +340,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_and_tool_events_do_not_shape_the_text() {
+    fn thinking_does_not_shape_the_text_but_is_retained() {
         let events = vec![
-            StreamEvent::ReasoningDelta {
+            StreamEvent::ThinkingStart { index: 0 },
+            StreamEvent::ThinkingDelta {
                 index: 0,
                 text: "thinking...".to_owned(),
+            },
+            StreamEvent::ThinkingEnd {
+                index: 0,
+                signature: Some("sig-1".to_owned()),
             },
             StreamEvent::ToolCallStart {
                 index: 1,
@@ -316,8 +367,42 @@ mod tests {
             },
         ];
         let completion = StreamAccumulator::fold(&events);
+        // Thinking is not text, but it is retained on the settled message.
         assert_eq!(completion.text_content(), "");
+        assert_eq!(completion.thinking_content(), "thinking...");
         assert_eq!(completion.finish_reason, FinishReason::ToolUse);
+        // The thinking part comes before the tool call, in index order, and
+        // carries the replay signature.
+        assert_eq!(
+            completion.content[0],
+            ContentPart::Thinking {
+                text: "thinking...".to_owned(),
+                signature: Some("sig-1".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn bracketing_events_do_not_add_content() {
+        // Text *Start/*End brackets frame the deltas but add no content of
+        // their own; only the deltas between them fold into the message.
+        let events = vec![
+            StreamEvent::TextStart { index: 0 },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "hi".to_owned(),
+            },
+            StreamEvent::TextEnd { index: 0 },
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            },
+        ];
+        let completion = StreamAccumulator::fold(&events);
+        assert_eq!(
+            completion.content,
+            vec![ContentPart::Text("hi".to_owned())]
+        );
     }
 
     #[test]

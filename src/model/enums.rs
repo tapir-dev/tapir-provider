@@ -112,40 +112,10 @@ pub enum Dialect {
     Harmony,
 }
 
-/// A discrete reasoning-effort level a Model can be asked for.
-///
-/// Ordered from least to most effort; a [`CompatConfig`](super::CompatConfig)
-/// maps the levels a given Model supports onto its wire representation.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-)]
-#[serde(rename_all = "lowercase")]
-#[non_exhaustive]
-pub enum ThinkingLevel {
-    /// No reasoning effort.
-    Off,
-    /// Minimal reasoning effort.
-    Minimal,
-    /// Low reasoning effort.
-    Low,
-    /// Medium reasoning effort.
-    Medium,
-    /// High reasoning effort.
-    High,
-    /// Extra-high reasoning effort.
-    XHigh,
-    /// The most reasoning effort the Model offers.
-    Max,
-}
+// The reasoning-effort level a Model can be asked for is the same neutral type
+// a caller sets on a request, so it lives with the request options and is
+// re-exported here for the catalog's use.
+pub use crate::request::ThinkingLevel;
 
 #[cfg(test)]
 mod tests {

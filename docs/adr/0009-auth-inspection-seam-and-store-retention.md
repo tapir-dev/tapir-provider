@@ -1,0 +1,10 @@
+# Auth inspection re-resolves through a retained Token Store
+
+`ModelRegistry` now answers "how would this Provider authenticate right now?" without spending a request: `get_auth(provider)` and `get_auth_for(entry)` return a `ResolvedAuth` (the winning `AuthSource` tier, the auth headers, an auth-derived key and base URL). To serve them, `load` retains the `Token Store` (`Option<Arc<dyn TokenStore>>` instead of a borrow) and each inspection re-resolves the Credential through it at call time rather than reading the API key already folded onto the Model Entry. We took this because a Model Entry carries only an API key — `load` drops OAuth material when folding — so an OAuth-configured Provider is invisible to the entry, and reporting its source (or refreshing a stale token) is only possible by going back to the store.
+
+## Consequences
+
+- The registry holds auth in two shapes on purpose: the eager API key folded onto each entry (drives `available_models` and `create_provider`), and the retained store the inspection path re-resolves against (drives `get_auth*`, and sees OAuth). A reader who expects one source of truth should know the split is deliberate.
+- Inspection is async and takes the transport: a stale stored OAuth token is refreshed over it and the renewal persisted through the store, so `get_auth` is not a pure read. A refresh failure is an `Authentication` error that preserves the stored credential for re-login and never falls back to the environment.
+- `load` changing from `&dyn TokenStore` to `Arc<dyn TokenStore>` is a breaking change taken now, pre-1.0 with no external consumers, rather than through a deprecation cycle. It also cost `ModelRegistry` its `PartialEq` and derived `Debug` (a trait object is neither), replaced by a manual `Debug` that omits the store.
+- Per-provider auth-header construction and OAuth-refresh discovery are dispatched by the same compiled-in `if provider_id == ...` arms `create_provider` uses, keeping the `Provider` trait about requests. Only Anthropic has an OAuth flow today; other Providers report a stored OAuth token as-is.

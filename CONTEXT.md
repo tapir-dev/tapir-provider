@@ -48,6 +48,20 @@ The persistence boundary for Credentials. The SDK reads and writes through it an
 owns refresh; the caller chooses where they live (file, OS keychain, ...).
 _Avoid_: Keyring, vault, cache.
 
+**Resolved Auth**:
+What one auth inspection produces: the request-ready material a Provider would send
+this turn — its auth headers, an auth-derived API key and base URL when there is one,
+and the Auth Source that won. Unlike a Credential (stored material), it is computed on
+demand and never persisted. A provider-scoped inspection carries only the auth headers;
+a Model-scoped one also layers that Model's headers and base URL.
+_Avoid_: Auth, resolved credential, auth result.
+
+**Auth Source**:
+Which tier a Resolved Auth came from — an explicit per-request key, a stored Credential,
+a named environment variable, or an OAuth token. The precedence resolution keeps this
+rather than discarding it, so a caller can see how a Provider is configured.
+_Avoid_: Origin, provenance, tier.
+
 **Registry**:
 The compiled-in set of available Providers and their identities (canonical id,
 aliases, default Credential source). Only entries whose feature is enabled are
@@ -82,11 +96,24 @@ _Avoid_: Conversation, session, prompt, request.
 
 **Completion Options**:
 The per-request knobs that steer generation rather than describe the conversation:
-sampling temperature, output-token cap, and tool choice. Passed alongside the Context.
+sampling temperature, output-token cap, tool choice, and Thinking Level. Passed
+alongside the Context.
 _Avoid_: Config, settings, params.
 
+**Thinking Level**:
+How hard the model is asked to reason before answering, as a Provider-neutral effort
+level rather than a raw token budget. A Provider that reasons by budget derives one
+from the level; a Provider without extended thinking ignores it.
+_Avoid_: Reasoning effort (as a wire term), budget, thinking tokens.
+
 **Assistant Message**:
-A reply produced by the model: its content parts (text and Tool Calls), token usage,
-and finish reason. It is both what a Provider returns and a Message in the Context,
-so a completion is appended to the conversation without conversion.
+A reply produced by the model: its content parts (text, Thinking, and Tool Calls),
+token usage, and finish reason. It is both what a Provider returns and a Message in
+the Context, so a completion is appended to the conversation without conversion.
 _Avoid_: Completion, response, reply.
+
+**Thinking**:
+The model's reasoning, carried as a content part of an Assistant Message and retained
+on the settled reply. It may carry an opaque signature that lets the reasoning be
+replayed to the Provider on a later turn.
+_Avoid_: Reasoning trace, chain of thought, scratchpad.

@@ -50,6 +50,7 @@
 #[cfg(any(feature = "anthropic", feature = "openai"))]
 mod base64;
 
+pub mod auth;
 /// The runtime [`ModelRegistry`] holding the Catalog and turning a Model Entry
 /// into a live Provider.
 #[cfg(feature = "models")]
@@ -73,6 +74,7 @@ pub mod token_store;
 #[cfg(feature = "test-utils")]
 pub mod vcr;
 
+pub use auth::{AuthSource, ResolvedAuth};
 #[cfg(feature = "models-user-config")]
 pub use catalog::user_config_path;
 #[cfg(feature = "models")]
@@ -88,12 +90,14 @@ pub use message::{
 #[cfg(feature = "models")]
 pub use model::{
     Api, CompatConfig, Dialect, InputType, Model, ModelCost, ModelEntry,
-    ThinkingLevel,
 };
 pub use model::{ModelId, ProviderId};
 pub use provider::Provider;
 pub use registry::{ProviderInfo, Registry};
-pub use request::{CompletionOptions, Context, ToolChoice, ToolDefinition};
+pub use request::{
+    CompletionOptions, Context, SystemPrompt, ThinkingLevel, ToolChoice,
+    ToolDefinition,
+};
 pub use response::{FinishReason, Usage};
 pub use retry::{Clock, RetryPolicy, RetryProvider, SystemClock};
 pub use sse::{SseDecoder, SseEvent};

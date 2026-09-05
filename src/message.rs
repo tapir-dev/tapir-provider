@@ -113,6 +113,15 @@ pub enum ContentPart {
         /// The tool's arguments, as a JSON value.
         arguments: serde_json::Value,
     },
+    /// A run of model reasoning ("thinking"), retained so a reply can be
+    /// replayed to the Provider on a later turn.
+    Thinking {
+        /// The reasoning text.
+        text: String,
+        /// The Provider's opaque signature for replaying this reasoning, when
+        /// one was supplied.
+        signature: Option<String>,
+    },
 }
 
 impl ContentPart {
@@ -138,6 +147,17 @@ impl ContentPart {
             arguments,
         }
     }
+
+    /// A thinking part carrying reasoning text and an optional replay signature.
+    pub fn thinking(
+        text: impl Into<String>,
+        signature: Option<String>,
+    ) -> Self {
+        Self::Thinking {
+            text: text.into(),
+            signature,
+        }
+    }
 }
 
 /// A reply produced by the model.
@@ -145,9 +165,11 @@ impl ContentPart {
 /// This is what a [`Provider`](crate::provider::Provider) returns and, being a
 /// [`Message::Assistant`] variant, also a message in the conversation — so a
 /// completion is appended for the next turn without conversion. Its content
-/// mixes text and [`ToolCall`](ContentPart::ToolCall) parts; reasoning is
-/// stream-only and not retained here. [`raw`](Self::raw) is the escape hatch to
-/// the Provider's untouched response body, absent on a streamed reply.
+/// mixes text, [`ToolCall`](ContentPart::ToolCall), and
+/// [`Thinking`](ContentPart::Thinking) parts, so reasoning survives into the
+/// settled reply and can be replayed on a later turn. [`raw`](Self::raw) is the
+/// escape hatch to the Provider's untouched response body, absent on a streamed
+/// reply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     /// The reply's content, as an ordered list of parts.
@@ -183,6 +205,19 @@ impl AssistantMessage {
             .iter()
             .filter_map(|part| match part {
                 ContentPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The reply's thinking parts concatenated in order; empty when the reply
+    /// carries no reasoning.
+    #[must_use]
+    pub fn thinking_content(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Thinking { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect()

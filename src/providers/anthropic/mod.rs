@@ -13,7 +13,10 @@ use crate::message::{
     AssistantMessage, ContentPart, ImageSource, Message, ToolResultMessage,
 };
 use crate::provider::Provider;
-use crate::request::{CompletionOptions, Context, ToolChoice, ToolDefinition};
+use crate::request::{
+    CompletionOptions, Context, SystemPrompt, ThinkingLevel, ToolChoice,
+    ToolDefinition,
+};
 use crate::response::{FinishReason, Usage, mint_call_id};
 use crate::sse::{SseDecoder, SseEvent};
 use crate::stream::{StreamEvent, StreamEvents};
@@ -21,7 +24,7 @@ use crate::token_store::{TokenStore, resolve};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::pin::Pin;
 use std::task::Poll;
@@ -99,6 +102,34 @@ impl AuthLane {
             Credential::ApiKey { .. } => Self::ApiKey,
         }
     }
+}
+
+/// The auth headers a request authenticating with `credential` carries.
+///
+/// The single source of truth for Anthropic's auth scheme: the api-key lane
+/// pins the `anthropic-version` header and the `x-api-key` secret; the OAuth
+/// lane carries the same version, a `Bearer` token, and the beta the API
+/// requires. Both the request path and the Model Registry's auth inspection go
+/// through this, so what one reports is exactly what the other sends.
+pub(crate) fn auth_headers(credential: &Credential) -> Vec<(String, String)> {
+    let mut headers =
+        vec![("anthropic-version".to_owned(), ANTHROPIC_VERSION.to_owned())];
+    match credential {
+        Credential::ApiKey { key, .. } => {
+            headers.push(("x-api-key".to_owned(), key.clone()));
+        }
+        Credential::OAuth(tokens) => {
+            headers.push((
+                "authorization".to_owned(),
+                format!("Bearer {}", tokens.access_token),
+            ));
+            headers.push((
+                "anthropic-beta".to_owned(),
+                ANTHROPIC_OAUTH_BETA.to_owned(),
+            ));
+        }
+    }
+    headers
 }
 
 /// A Provider for Anthropic's Messages API.
@@ -240,7 +271,13 @@ impl<H: HttpClient> AnthropicProvider<H> {
         opts: &CompletionOptions,
         streaming: Streaming,
     ) -> Result<HttpRequest, Error> {
-        let lane = AuthLane::for_credential(&self.credential);
+        // An explicit per-request key overrides the constructed Credential for
+        // this call; an explicit key always rides the api-key lane.
+        let override_credential =
+            opts.api_key.as_deref().map(Credential::api_key);
+        let credential =
+            override_credential.as_ref().unwrap_or(&self.credential);
+        let lane = AuthLane::for_credential(credential);
 
         let body = serde_json::to_vec(&WireRequest::from_context(
             &self.model,
@@ -254,21 +291,12 @@ impl<H: HttpClient> AnthropicProvider<H> {
         let url =
             format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let request = HttpRequest::new(Method::Post, url)
-            .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
-        // OAuth authorizes with a Bearer token and must announce the beta;
-        // an API key stays on the `x-api-key` lane.
-        let request = match &self.credential {
-            Credential::ApiKey { key, .. } => {
-                request.header("x-api-key", key.as_str())
-            }
-            Credential::OAuth(tokens) => request
-                .header(
-                    "authorization",
-                    format!("Bearer {}", tokens.access_token),
-                )
-                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA),
-        };
+        // Auth headers (version, and the lane's secret) come from the one
+        // scheme definition, so the wire matches what auth inspection reports.
+        let request = auth_headers(credential)
+            .into_iter()
+            .fold(request, |req, (name, value)| req.header(name, value));
         // Caller headers ride last, so a proxy or gateway can key off them.
         let request = self
             .extra_headers
@@ -472,9 +500,9 @@ impl futures_core::Stream for SseEventStream {
 ///
 /// It threads the small amount of state the mapping needs: the running token
 /// usage (Anthropic reports input tokens up front and output tokens at the
-/// end), the finish reason from `message_delta`, and which content-block
-/// indices are tool calls, so a `content_block_stop` on one becomes a
-/// [`StreamEvent::ToolCallEnd`].
+/// end), the finish reason from `message_delta`, which content-block indices are
+/// text, thinking, or tool calls (so a `content_block_stop` becomes the matching
+/// `*End` event), and the replay signature accumulated for each thinking block.
 #[derive(Debug, Default)]
 struct StreamNormalizer {
     /// Input tokens, reported in `message_start`.
@@ -483,8 +511,14 @@ struct StreamNormalizer {
     output_tokens: u32,
     /// Finish reason, reported in `message_delta`.
     finish_reason: Option<FinishReason>,
+    /// Content-block indices that opened as text.
+    text_indices: HashSet<usize>,
+    /// Content-block indices that opened as thinking.
+    thinking_indices: HashSet<usize>,
     /// Content-block indices that opened as tool calls.
     tool_indices: HashSet<usize>,
+    /// Replay signatures accumulated per thinking block index.
+    signatures: HashMap<usize, String>,
 }
 
 impl StreamNormalizer {
@@ -518,19 +552,32 @@ impl StreamNormalizer {
             }
             Some("content_block_start") => {
                 let block = &json["content_block"];
-                if block["type"] == "tool_use" {
-                    self.tool_indices.insert(index);
-                    vec![StreamEvent::ToolCallStart {
-                        index,
-                        id: block["id"].as_str().unwrap_or_default().to_owned(),
-                        name: block["name"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned(),
-                    }]
-                } else {
-                    // A text or reasoning block opens with no incremental content.
-                    vec![]
+                match block["type"].as_str() {
+                    Some("tool_use") => {
+                        self.tool_indices.insert(index);
+                        vec![StreamEvent::ToolCallStart {
+                            index,
+                            id: block["id"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                            name: block["name"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        }]
+                    }
+                    Some("text") => {
+                        self.text_indices.insert(index);
+                        vec![StreamEvent::TextStart { index }]
+                    }
+                    Some("thinking") => {
+                        self.thinking_indices.insert(index);
+                        vec![StreamEvent::ThinkingStart { index }]
+                    }
+                    // Redacted thinking and any other block open with no
+                    // incremental content this crate models.
+                    _ => vec![],
                 }
             }
             Some("content_block_delta") => {
@@ -544,7 +591,7 @@ impl StreamNormalizer {
                             .to_owned(),
                     }],
                     Some("thinking_delta") => {
-                        vec![StreamEvent::ReasoningDelta {
+                        vec![StreamEvent::ThinkingDelta {
                             index,
                             text: delta["thinking"]
                                 .as_str()
@@ -561,13 +608,30 @@ impl StreamNormalizer {
                                 .to_owned(),
                         }]
                     }
-                    // e.g. `signature_delta`: recognized event, unmodeled delta.
+                    Some("signature_delta") => {
+                        // Accumulate the replay signature; it surfaces on the
+                        // block's `ThinkingEnd`, not as an event of its own.
+                        if let Some(sig) = delta["signature"].as_str() {
+                            self.signatures
+                                .entry(index)
+                                .or_default()
+                                .push_str(sig);
+                        }
+                        vec![]
+                    }
                     _ => vec![StreamEvent::Unknown(json)],
                 }
             }
             Some("content_block_stop") => {
                 if self.tool_indices.contains(&index) {
                     vec![StreamEvent::ToolCallEnd { index }]
+                } else if self.text_indices.contains(&index) {
+                    vec![StreamEvent::TextEnd { index }]
+                } else if self.thinking_indices.contains(&index) {
+                    vec![StreamEvent::ThinkingEnd {
+                        index,
+                        signature: self.signatures.remove(&index),
+                    }]
                 } else {
                     vec![]
                 }
@@ -613,6 +677,16 @@ struct WireRequest<'a> {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<WireThinking>,
+}
+
+/// Anthropic's extended-thinking request block: budget-based ("enabled") mode.
+#[derive(Debug, Serialize)]
+struct WireThinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    budget_tokens: u32,
 }
 
 /// Serde predicate: omit a `false` flag from the request body.
@@ -629,7 +703,7 @@ impl<'a> WireRequest<'a> {
         lane: AuthLane,
     ) -> Self {
         let messages = ctx.messages.iter().map(wire_message).collect();
-        let system = wire_system(ctx.system_prompt.clone(), lane);
+        let system = wire_system(ctx.system_prompt.as_ref(), lane);
 
         let tools = ctx
             .tools
@@ -637,15 +711,39 @@ impl<'a> WireRequest<'a> {
             .map(|tool| WireTool::from_tool(tool, lane))
             .collect();
 
+        // Extended thinking, when asked for, reasons by token budget derived
+        // from the neutral level. It shares the response ceiling with the
+        // answer, so bump `max_tokens` to leave room, and it requires an unset
+        // temperature, which Anthropic reads as `1.0`.
+        let mut max_tokens = opts.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        let level = opts.thinking.filter(|level| *level != ThinkingLevel::Off);
+        let (thinking, temperature) = match level {
+            Some(level) => {
+                let budget = level.default_budget();
+                if max_tokens <= budget {
+                    max_tokens = budget + DEFAULT_MAX_TOKENS;
+                }
+                (
+                    Some(WireThinking {
+                        kind: "enabled",
+                        budget_tokens: budget,
+                    }),
+                    Some(1.0),
+                )
+            }
+            None => (None, opts.temperature),
+        };
+
         Self {
             model,
-            max_tokens: opts.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            max_tokens,
             messages,
-            temperature: opts.temperature,
+            temperature,
             system,
             tools,
             tool_choice: opts.tool_choice.as_ref().map(wire_tool_choice),
             stream: streaming.enabled(),
+            thinking,
         }
     }
 }
@@ -730,18 +828,24 @@ impl WireSystemBlock {
 
 /// Shape the caller's system prompt for the chosen lane.
 ///
-/// The OAuth lane always yields at least the identity block — the API rejects
-/// an OAuth request without it — so this returns `Some` even when the caller
-/// supplied no system prompt.
+/// An empty prompt is dropped, so the API-key lane omits `system` entirely
+/// rather than sending an empty string. The OAuth lane always yields at least
+/// the identity block — the API rejects an OAuth request without it — so this
+/// returns `Some` even when the caller supplied no system prompt.
 fn wire_system(
-    caller_system: Option<String>,
+    caller_system: Option<&SystemPrompt>,
     lane: AuthLane,
 ) -> Option<WireSystem> {
+    let caller = caller_system
+        .map(SystemPrompt::as_str)
+        .filter(|text| !text.is_empty());
     match lane {
-        AuthLane::ApiKey => caller_system.map(WireSystem::Text),
+        AuthLane::ApiKey => {
+            caller.map(|text| WireSystem::Text(text.to_owned()))
+        }
         AuthLane::OAuth => {
             let mut blocks = vec![WireSystemBlock::text(CLAUDE_CODE_IDENTITY)];
-            if let Some(caller) = caller_system {
+            if let Some(caller) = caller {
                 blocks.push(WireSystemBlock::text(caller));
             }
             Some(WireSystem::Blocks(blocks))
@@ -870,25 +974,28 @@ fn wire_content(parts: &[ContentPart]) -> WireContent<'_> {
     if let [ContentPart::Text(text)] = parts {
         return WireContent::Text(text.as_str());
     }
-    WireContent::Blocks(parts.iter().map(wire_content_part).collect())
+    WireContent::Blocks(parts.iter().filter_map(wire_content_part).collect())
 }
 
-/// Map one neutral content part onto an Anthropic content block.
-fn wire_content_part(part: &ContentPart) -> WireContentPart<'_> {
+/// Map one neutral content part onto an Anthropic content block, or `None` for a
+/// part with no request-content representation.
+fn wire_content_part(part: &ContentPart) -> Option<WireContentPart<'_>> {
     match part {
-        ContentPart::Text(text) => WireContentPart::Text { text },
-        ContentPart::Image(source) => WireContentPart::Image {
+        ContentPart::Text(text) => Some(WireContentPart::Text { text }),
+        ContentPart::Image(source) => Some(WireContentPart::Image {
             source: wire_image_source(source),
-        },
+        }),
         ContentPart::ToolCall {
             id,
             name,
             arguments,
-        } => WireContentPart::ToolUse {
+        } => Some(WireContentPart::ToolUse {
             id,
             name,
             input: arguments,
-        },
+        }),
+        // Thinking is not replayed on the request without its full block shape.
+        ContentPart::Thinking { .. } => None,
     }
 }
 
@@ -1133,6 +1240,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wire_system_omits_an_empty_prompt_on_the_api_key_lane() {
+        let empty = SystemPrompt::new("");
+        assert!(wire_system(Some(&empty), AuthLane::ApiKey).is_none());
+        assert!(wire_system(None, AuthLane::ApiKey).is_none());
+
+        // The OAuth lane still sends the identity block, and drops the empty
+        // caller prompt from the block list.
+        let Some(WireSystem::Blocks(blocks)) =
+            wire_system(Some(&empty), AuthLane::OAuth)
+        else {
+            panic!("expected identity blocks on the OAuth lane");
+        };
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, CLAUDE_CODE_IDENTITY);
+    }
+
     #[tokio::test]
     async fn sends_api_key_and_version_headers_with_the_body() {
         let mock = std::sync::Arc::new(MockHttpClient::with_response(
@@ -1172,6 +1296,91 @@ mod tests {
         assert_eq!(body["system"], "Be terse.");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Hi");
+    }
+
+    #[tokio::test]
+    async fn per_request_api_key_overrides_the_constructed_credential() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-constructed"),
+            "claude-3-5-sonnet",
+        );
+
+        let ctx = Context::new(vec![Message::user("Hi")]);
+        let opts = opts().with_api_key("sk-explicit");
+        provider.complete(&ctx, &opts).await.unwrap();
+
+        let sent = mock.last_request();
+        // The explicit per-request key reached the wire on the api-key lane...
+        assert!(
+            sent.headers
+                .iter()
+                .any(|(k, v)| k == "x-api-key" && v == "sk-explicit")
+        );
+        // ...and the constructed Credential was not sent.
+        assert!(!sent.headers.iter().any(|(_, v)| v == "sk-constructed"));
+    }
+
+    #[tokio::test]
+    async fn thinking_option_sends_a_budget_block_and_forces_temperature() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-secret"),
+            "claude-haiku-4-5",
+        );
+
+        let ctx = Context::new(vec![Message::user("Hi")]);
+        let opts = opts()
+            .with_temperature(0.2)
+            .with_max_tokens(64)
+            .with_thinking(ThinkingLevel::Low);
+        provider.complete(&ctx, &opts).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        // Low derives a 2048-token budget in the "enabled" (budget) shape.
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 2048);
+        // max_tokens (64) sat below the budget, so it is lifted to leave the
+        // answer room beyond the thinking budget.
+        assert_eq!(body["max_tokens"], 2048 + 1024);
+        // Extended thinking requires temperature 1.0, overriding the caller's.
+        assert_eq!(body["temperature"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn no_thinking_option_omits_the_block_and_keeps_temperature() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-secret"),
+            "claude-haiku-4-5",
+        );
+
+        let ctx = Context::new(vec![Message::user("Hi")]);
+        let opts = opts().with_temperature(0.2).with_max_tokens(64);
+        provider.complete(&ctx, &opts).await.unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(
+            mock.last_request().body.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], 64);
+        assert_eq!(body["temperature"], 0.2);
     }
 
     #[tokio::test]
@@ -1624,13 +1833,16 @@ mod tests {
         let events = collect_stream(&provider).await;
 
         assert_eq!(events.first(), Some(&StreamEvent::MessageStart));
+        assert_eq!(events[1], StreamEvent::TextStart { index: 0 });
         assert_eq!(
-            events[1],
+            events[2],
             StreamEvent::TextDelta {
                 index: 0,
                 text: "Hello".to_owned()
             }
         );
+        // The text block closes before the terminal Done.
+        assert!(events.contains(&StreamEvent::TextEnd { index: 0 }));
         assert!(matches!(
             events.last(),
             Some(StreamEvent::Done {
@@ -1720,12 +1932,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_reasoning_deltas_from_thinking_blocks() {
+    async fn streams_thinking_lifecycle_and_retains_it() {
         let stream = concat!(
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me think\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-xyz\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
@@ -1739,15 +1955,33 @@ mod tests {
         );
 
         let events = collect_stream(&provider).await;
+        // The block opens, deltas, and closes; the signature rides on the end.
+        assert_eq!(events[0], StreamEvent::ThinkingStart { index: 0 });
         assert_eq!(
-            events[0],
-            StreamEvent::ReasoningDelta {
+            events[1],
+            StreamEvent::ThinkingDelta {
                 index: 0,
                 text: "let me think".to_owned(),
             }
         );
-        // Reasoning never contributes to the folded completion text.
-        assert_eq!(StreamAccumulator::fold(&events).text_content(), "");
+        assert_eq!(
+            events[2],
+            StreamEvent::ThinkingEnd {
+                index: 0,
+                signature: Some("sig-xyz".to_owned()),
+            }
+        );
+        // Thinking is not text, but it is retained on the folded completion.
+        let folded = StreamAccumulator::fold(&events);
+        assert_eq!(folded.text_content(), "");
+        assert_eq!(folded.thinking_content(), "let me think");
+        assert_eq!(
+            folded.content[0],
+            ContentPart::Thinking {
+                text: "let me think".to_owned(),
+                signature: Some("sig-xyz".to_owned()),
+            }
+        );
     }
 
     #[tokio::test]
