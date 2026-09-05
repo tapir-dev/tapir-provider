@@ -45,10 +45,14 @@ pub enum FinishReason {
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
 )]
 pub struct Usage {
-    /// Tokens consumed by the prompt.
+    /// Uncached prompt tokens: input served neither from nor into the cache.
     pub input_tokens: u32,
     /// Tokens produced in the completion.
     pub output_tokens: u32,
+    /// Prompt tokens served from the cache, disjoint from `input_tokens`.
+    pub cache_read_tokens: u32,
+    /// Prompt tokens written into the cache, disjoint from `input_tokens`.
+    pub cache_write_tokens: u32,
 }
 
 #[cfg(test)]
@@ -60,6 +64,8 @@ mod tests {
         let usage = Usage::default();
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_write_tokens, 0);
     }
 
     #[test]

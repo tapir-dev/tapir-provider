@@ -511,6 +511,10 @@ struct StreamNormalizer {
     input_tokens: u32,
     /// Output tokens, reported cumulatively in `message_delta`.
     output_tokens: u32,
+    /// Cache-read prompt tokens, reported in `message_start`.
+    cache_read_tokens: u32,
+    /// Cache-write prompt tokens, reported in `message_start`.
+    cache_write_tokens: u32,
     /// Finish reason, reported in `message_delta`.
     finish_reason: Option<FinishReason>,
     /// Content-block indices that opened as text.
@@ -529,6 +533,8 @@ impl StreamNormalizer {
         Usage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
         }
     }
 
@@ -547,9 +553,11 @@ impl StreamNormalizer {
 
         match sse.event.as_deref() {
             Some("message_start") => {
-                self.input_tokens = json["message"]["usage"]["input_tokens"]
-                    .as_u64()
-                    .unwrap_or(0) as u32;
+                let usage = &json["message"]["usage"];
+                let count = |key| usage[key].as_u64().unwrap_or(0) as u32;
+                self.input_tokens = count("input_tokens");
+                self.cache_read_tokens = count("cache_read_input_tokens");
+                self.cache_write_tokens = count("cache_creation_input_tokens");
                 vec![StreamEvent::MessageStart]
             }
             Some("content_block_start") => {
@@ -1173,6 +1181,8 @@ impl WireResponse {
             usage: Usage {
                 input_tokens: self.usage.input_tokens,
                 output_tokens: self.usage.output_tokens,
+                cache_read_tokens: self.usage.cache_read_input_tokens,
+                cache_write_tokens: self.usage.cache_creation_input_tokens,
             },
             finish_reason: map_finish_reason(self.stop_reason),
             raw: Some(raw),
@@ -1205,6 +1215,12 @@ struct WireUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    /// Prompt tokens written into the cache (Anthropic's `creation` wire word).
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    /// Prompt tokens served from the cache.
+    #[serde(default)]
+    cache_read_input_tokens: u32,
 }
 
 fn map_finish_reason(stop_reason: Option<String>) -> FinishReason {
@@ -1338,6 +1354,38 @@ mod tests {
         assert_eq!(response.usage.output_tokens, 5);
         assert_eq!(response.finish_reason, FinishReason::Stop);
         assert_eq!(response.raw.as_ref().unwrap()["id"], "msg_123");
+    }
+
+    #[tokio::test]
+    async fn parses_cache_token_counts_on_the_non_streaming_path() {
+        let body = r#"{
+            "id": "msg_cache",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 8
+            }
+        }"#;
+        let mock =
+            std::sync::Arc::new(MockHttpClient::with_response(200, body));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet-20241022",
+        );
+
+        let ctx = Context::new(vec![Message::user("Hello")]);
+        let response = provider.complete(&ctx, &opts()).await.unwrap();
+
+        // Uncached input stays uncached-only; cache counts land in their fields.
+        assert_eq!(response.usage.input_tokens, 12);
+        assert_eq!(response.usage.cache_write_tokens, 20);
+        assert_eq!(response.usage.cache_read_tokens, 8);
     }
 
     #[tokio::test]
@@ -2045,7 +2093,8 @@ mod tests {
                 finish_reason: FinishReason::Stop,
                 usage: Usage {
                     input_tokens: 7,
-                    output_tokens: 5
+                    output_tokens: 5,
+                    ..
                 }
             })
         ));
@@ -2056,6 +2105,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn streaming_captures_cache_tokens_from_message_start() {
+        // Cache counts arrive in `message_start`; every later usage carries them.
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0,\"cache_creation_input_tokens\":20,\"cache_read_input_tokens\":8}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mock = std::sync::Arc::new(MockHttpClient::with_stream(vec![
+            stream.as_bytes().to_vec(),
+        ]));
+        let provider = AnthropicProvider::new(
+            mock,
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+
+        let events = collect_stream(&provider).await;
+
+        // The incremental Usage event carries the cache counts from the start.
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.cache_write_tokens, 20);
+        assert_eq!(usage.cache_read_tokens, 8);
+
+        // The terminal Done folds the same counts into its final usage.
+        let Some(StreamEvent::Done { usage, .. }) = events.last() else {
+            panic!("stream did not end in Done");
+        };
+        assert_eq!(usage.cache_write_tokens, 20);
+        assert_eq!(usage.cache_read_tokens, 8);
     }
 
     #[tokio::test]

@@ -555,6 +555,7 @@ impl StreamNormalizer {
                     as u32,
                 output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0)
                     as u32,
+                ..Usage::default()
             };
             events.push(StreamEvent::Usage(self.usage));
         }
@@ -895,6 +896,7 @@ impl WireResponse {
         let usage = Usage {
             input_tokens: self.usage.prompt_tokens,
             output_tokens: self.usage.completion_tokens,
+            ..Usage::default()
         };
         // Chat Completions returns a single choice for the default `n`; take the
         // first and leave the rest to the raw escape hatch.
@@ -1429,7 +1431,8 @@ mod tests {
                 finish_reason: FinishReason::Stop,
                 usage: Usage {
                     input_tokens: 7,
-                    output_tokens: 5
+                    output_tokens: 5,
+                    ..
                 }
             })
         ));

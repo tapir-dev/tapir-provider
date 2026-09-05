@@ -156,6 +156,7 @@ impl WireResponse {
             usage: Usage {
                 input_tokens: self.usage.prompt_tokens,
                 output_tokens: 0,
+                ..Usage::default()
             },
             raw,
         }

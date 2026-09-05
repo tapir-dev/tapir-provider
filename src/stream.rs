@@ -305,6 +305,7 @@ mod tests {
                 usage: Usage {
                     input_tokens: 3,
                     output_tokens: 4,
+                    ..Usage::default()
                 },
             },
         ];
@@ -501,12 +502,14 @@ mod tests {
             StreamEvent::Usage(Usage {
                 input_tokens: 10,
                 output_tokens: 2,
+                ..Usage::default()
             }),
             StreamEvent::Done {
                 finish_reason: FinishReason::Stop,
                 usage: Usage {
                     input_tokens: 10,
                     output_tokens: 7,
+                    ..Usage::default()
                 },
             },
         ];
