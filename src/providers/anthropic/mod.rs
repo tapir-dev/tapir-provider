@@ -25,7 +25,6 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 /// Default base URL for the Anthropic API.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -374,12 +373,7 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
         let response = self.http.send(http_request).await?;
 
         if !response.is_success() {
-            let error =
-                Error::from_status(response.status, response.body_string());
-            return Err(match parse_retry_after(&response.headers) {
-                Some(delay) => error.with_retry_after(delay),
-                None => error,
-            });
+            return Err(crate::http::error_from_response(&response));
         }
 
         let wire: WireResponse =
@@ -858,38 +852,9 @@ fn wire_image_source(source: &ImageSource) -> WireImageSource<'_> {
         },
         ImageSource::Bytes { media_type, data } => WireImageSource::Base64 {
             media_type: media_type.as_wire(),
-            data: Cow::Owned(base64_encode(data)),
+            data: Cow::Owned(crate::base64::base64_encode(data)),
         },
     }
-}
-
-/// Standard base64-encode (RFC 4648) with padding, no line breaks.
-///
-/// Hand-rolled to keep the crate's dependency set minimal; raw-bytes images
-/// are the only caller.
-fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
-        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[((n >> 6) & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(n & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// The Anthropic response body.
@@ -964,20 +929,6 @@ struct WireUsage {
     output_tokens: u32,
 }
 
-/// Parse a `Retry-After` header as a whole number of seconds.
-///
-/// The Anthropic API reports the delay in `delay-seconds` form; the HTTP-date
-/// form is not emitted here, so it is not parsed. An absent, non-numeric, or
-/// oversized value yields `None`, letting the retry decorator fall back to its
-/// own backoff.
-fn parse_retry_after(headers: &[(String, String)]) -> Option<Duration> {
-    headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
-        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-}
-
 fn map_finish_reason(stop_reason: Option<String>) -> FinishReason {
     match stop_reason.as_deref() {
         Some("end_turn") => FinishReason::Stop,
@@ -997,6 +948,7 @@ mod tests {
     use crate::message::{MediaType, Message};
     use crate::stream::StreamAccumulator;
     use futures_util::StreamExt;
+    use std::time::Duration;
 
     /// Send one request and return its parsed JSON body.
     async fn sent_body(request: CompletionRequest) -> serde_json::Value {
@@ -1481,16 +1433,6 @@ mod tests {
         assert_eq!(source["data"], "aGk=");
     }
 
-    #[test]
-    fn base64_encode_matches_known_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"M"), "TQ==");
-        assert_eq!(base64_encode(b"Ma"), "TWE=");
-        assert_eq!(base64_encode(b"Man"), "TWFu");
-        assert_eq!(base64_encode(b"Many"), "TWFueQ==");
-        assert_eq!(base64_encode(b"Manag"), "TWFuYWc=");
-    }
-
     #[tokio::test]
     async fn tool_use_response_normalizes_with_both_ids() {
         let response = r#"{
@@ -1590,19 +1532,6 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::RateLimited);
         assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
-    }
-
-    #[test]
-    fn parse_retry_after_reads_delay_seconds_case_insensitively() {
-        let headers = vec![("retry-after".to_owned(), " 12 ".to_owned())];
-        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(12)));
-        // An HTTP-date form is not parsed.
-        let dated = vec![(
-            "Retry-After".to_owned(),
-            "Wed, 21 Oct 2026 07:28:00 GMT".to_owned(),
-        )];
-        assert_eq!(parse_retry_after(&dated), None);
-        assert_eq!(parse_retry_after(&[]), None);
     }
 
     #[tokio::test]

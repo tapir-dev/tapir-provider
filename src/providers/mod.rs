@@ -8,3 +8,9 @@ pub mod anthropic;
 
 #[cfg(feature = "anthropic")]
 pub use anthropic::{AnthropicBuilder, AnthropicProvider};
+
+#[cfg(feature = "openai")]
+pub mod openai;
+
+#[cfg(feature = "openai")]
+pub use openai::{OpenAIBuilder, OpenAIEmbeddingProvider, OpenAIProvider};

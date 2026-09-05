@@ -21,6 +21,37 @@ use std::pin::Pin;
 pub type ByteStream =
     Pin<Box<dyn futures_core::Stream<Item = Result<Vec<u8>, Error>> + Send>>;
 
+/// Parse a `Retry-After` header as a whole number of seconds.
+///
+/// Providers report the delay in `delay-seconds` form; the HTTP-date form is not
+/// emitted, so it is not parsed. An absent, non-numeric, or oversized value
+/// yields `None`, letting the retry decorator fall back to its own backoff.
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+pub(crate) fn parse_retry_after(
+    headers: &[(String, String)],
+) -> Option<std::time::Duration> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+}
+
+/// Turn a non-2xx [`HttpResponse`] into a typed [`Error`], classifying the kind
+/// from the status and attaching any server-requested `Retry-After` delay.
+///
+/// The Providers share this so a failed response maps to the same typed error
+/// everywhere, and a `Retry-After` is always honored by the
+/// [`RetryProvider`](crate::retry::RetryProvider).
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+pub(crate) fn error_from_response(response: &HttpResponse) -> Error {
+    let error = Error::from_status(response.status, response.body_string());
+    match parse_retry_after(&response.headers) {
+        Some(delay) => error.with_retry_after(delay),
+        None => error,
+    }
+}
+
 /// The HTTP method for an [`HttpRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -383,6 +414,25 @@ mod mock {
 
 #[cfg(feature = "test-utils")]
 pub use mock::MockHttpClient;
+
+#[cfg(all(test, any(feature = "anthropic", feature = "openai")))]
+mod retry_after_tests {
+    use super::parse_retry_after;
+    use std::time::Duration;
+
+    #[test]
+    fn reads_delay_seconds_case_insensitively() {
+        let headers = vec![("retry-after".to_owned(), " 12 ".to_owned())];
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(12)));
+        // An HTTP-date form is not parsed.
+        let dated = vec![(
+            "Retry-After".to_owned(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_owned(),
+        )];
+        assert_eq!(parse_retry_after(&dated), None);
+        assert_eq!(parse_retry_after(&[]), None);
+    }
+}
 
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {

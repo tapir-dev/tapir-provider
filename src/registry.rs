@@ -53,6 +53,8 @@ impl ProviderInfo {
 const ENTRIES: &[ProviderInfo] = &[
     #[cfg(feature = "anthropic")]
     crate::providers::anthropic::INFO,
+    #[cfg(feature = "openai")]
+    crate::providers::openai::INFO,
 ];
 
 /// The compiled-in catalog of available [`Provider`]s.
@@ -113,6 +115,14 @@ impl Registry {
         #[cfg(feature = "anthropic")]
         if info.id == crate::providers::anthropic::INFO.id {
             let provider = crate::providers::AnthropicProvider::resolve(
+                transport, model, credential, None,
+            )?;
+            return Ok(Arc::new(provider));
+        }
+
+        #[cfg(feature = "openai")]
+        if info.id == crate::providers::openai::INFO.id {
+            let provider = crate::providers::OpenAIProvider::resolve(
                 transport, model, credential, None,
             )?;
             return Ok(Arc::new(provider));
@@ -226,25 +236,97 @@ mod anthropic_tests {
     #[test]
     fn building_an_unknown_provider_fails_cleanly() {
         let http = Arc::new(MockHttpClient::new());
+        // A name no compiled-in Provider claims, whatever features are on.
         // `Arc<dyn Provider>` is not `Debug`, so match rather than `unwrap_err`.
         let Err(err) = Registry::build(
-            "openai",
-            "gpt-4",
+            "cohere",
+            "command",
             Some(Credential::api_key("sk-test")),
             http,
         ) else {
             panic!("an unknown provider must not build");
         };
         assert_eq!(err.kind(), ErrorKind::InvalidRequest);
-        assert!(err.message().contains("openai"));
+        assert!(err.message().contains("cohere"));
+    }
+}
+
+#[cfg(all(test, feature = "openai", feature = "test-utils"))]
+mod openai_tests {
+    use super::*;
+    use crate::http::MockHttpClient;
+    use crate::message::Message;
+    use crate::request::CompletionRequest;
+
+    const SAMPLE_RESPONSE: &str = r#"{
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "hi"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+    }"#;
+
+    #[test]
+    fn openai_is_compiled_in_and_resolves_by_id_and_alias() {
+        assert!(Registry::provider_ids().contains(&"openai"));
+        assert_eq!(Registry::resolve("openai").unwrap().id, "openai");
+        // The `gpt` alias selects the same Provider, case-insensitively.
+        assert_eq!(Registry::resolve("gpt").unwrap().id, "openai");
+        assert_eq!(Registry::resolve("OpenAI").unwrap().id, "openai");
+        assert_eq!(
+            Registry::resolve("openai").unwrap().api_key_env,
+            "OPENAI_API_KEY"
+        );
+    }
+
+    #[tokio::test]
+    async fn builds_openai_by_name_and_completes() {
+        let http =
+            Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
+        let provider = Registry::build(
+            "openai",
+            "gpt-4o-mini",
+            Some(Credential::api_key("sk-test")),
+            http.clone(),
+        )
+        .unwrap();
+
+        let response = provider
+            .complete(CompletionRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap();
+        assert_eq!(response.text, "hi");
+        // The resolved key reached the wire on the Bearer lane.
+        assert!(
+            http.last_request()
+                .headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == "Bearer sk-test")
+        );
+    }
+}
+
+// Enabling both provider features registers both Providers; enabling only one
+// registers only that one. The `--all-features` run enables both and exercises
+// this; a single-feature run exercises the exclusive arms.
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[test]
+    fn each_enabled_provider_feature_is_registered() {
+        let ids = Registry::provider_ids();
+        assert_eq!(cfg!(feature = "anthropic"), ids.contains(&"anthropic"));
+        assert_eq!(cfg!(feature = "openai"), ids.contains(&"openai"));
     }
 }
 
 // A build with no Provider feature enabled: the Registry is empty and building
-// any Provider by name fails cleanly. Only reachable when `anthropic` is off, so
-// the default `--all-features` test run skips it; a `--no-default-features` run
-// exercises it.
-#[cfg(all(test, not(feature = "anthropic")))]
+// any Provider by name fails cleanly. Only reachable when every Provider feature
+// is off, so the default `--all-features` test run skips it; a
+// `--no-default-features` run exercises it.
+#[cfg(all(test, not(any(feature = "anthropic", feature = "openai"))))]
 mod empty_tests {
     use super::*;
 

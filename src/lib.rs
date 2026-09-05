@@ -8,9 +8,11 @@
 //! without a network in tests. Requests and responses use a normalized message
 //! model, and failures surface as a typed [`Error`] with an [`ErrorKind`].
 //!
-//! This is the crate spine: today it ships the Anthropic Provider (behind the
-//! `anthropic` feature) doing both a single, non-streaming completion and a
-//! streamed one that yields incremental [`StreamEvent`]s.
+//! This is the crate spine: it ships the Anthropic and OpenAI Providers (each
+//! behind its own feature) doing both a single, non-streaming completion and a
+//! streamed one that yields incremental [`StreamEvent`]s, plus an
+//! [`EmbeddingProvider`] for turning input texts into vectors. A [`Registry`]
+//! selects a Provider by name, registering only the ones compiled in.
 //!
 //! # Example
 //!
@@ -44,7 +46,12 @@
 
 #![forbid(unsafe_code)]
 
+/// Shared base64 encoder, compiled only for the Providers that inline image bytes.
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+mod base64;
+
 pub mod credential;
+pub mod embedding;
 pub mod error;
 pub mod http;
 pub mod message;
@@ -59,6 +66,7 @@ pub mod stream;
 pub mod token_store;
 
 pub use credential::{Credential, OAuthTokens};
+pub use embedding::{EmbeddingProvider, EmbeddingRequest, EmbeddingResponse};
 pub use error::{Error, ErrorKind};
 pub use http::{ByteStream, HttpClient, HttpRequest, HttpResponse, Method};
 pub use message::{ContentPart, ImageSource, MediaType, Message, Role};
@@ -80,3 +88,6 @@ pub use providers::anthropic::oauth::{
 };
 #[cfg(feature = "anthropic")]
 pub use providers::{AnthropicBuilder, AnthropicProvider};
+
+#[cfg(feature = "openai")]
+pub use providers::{OpenAIBuilder, OpenAIEmbeddingProvider, OpenAIProvider};
