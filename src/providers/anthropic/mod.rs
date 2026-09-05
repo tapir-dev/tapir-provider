@@ -53,6 +53,10 @@ const DEFAULT_MAX_TOKENS: u32 = 1024;
 /// `anthropic-beta` header value the OAuth lane must send; the API rejects an
 /// OAuth request without it.
 const ANTHROPIC_OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
+/// `anthropic-beta` flag [`Extended`](CachePolicy::Extended) retention requires
+/// for its `1h` markers. Merged into any existing beta list rather than
+/// replacing it, so the OAuth lane's own flags survive.
+const EXTENDED_CACHE_BETA: &str = "extended-cache-ttl-2025-04-11";
 /// System block the OAuth lane prepends ahead of the caller's own prompt; the
 /// API rejects an OAuth request whose leading system block is anything else.
 const CLAUDE_CODE_IDENTITY: &str =
@@ -296,10 +300,16 @@ impl<H: HttpClient> AnthropicProvider<H> {
         // auth inspection reports) then construction-time headers, and let the
         // per-request options append their static headers and run the Header
         // Transform with the final say.
-        let base = auth_headers(credential)
+        let mut base: Vec<(String, String)> = auth_headers(credential)
             .into_iter()
             .chain(self.extra_headers.iter().cloned())
             .collect();
+        // Extended retention needs its beta merged onto whatever the lane
+        // already sends. Derived from the same `opts.cache` that shaped the body
+        // marker, so the 1h header and the 1h marker travel together.
+        if let Some(beta) = cache_shaping(opts.cache).and_then(|s| s.beta) {
+            merge_anthropic_beta(&mut base, beta);
+        }
         let request = opts
             .finalize_headers(base)
             .into_iter()
@@ -708,28 +718,72 @@ fn is_false(flag: &bool) -> bool {
 /// cache breakpoint: the request prefix up to and including it is cached.
 ///
 /// `Standard` retention emits the bare `{"type":"ephemeral"}` form — no `ttl`,
-/// and no cache beta header, since base prompt caching is generally available.
+/// since base prompt caching's default window is generally available.
+/// `Extended` sets `ttl:"1h"`, which also requires the extended-cache beta.
 #[derive(Debug, Clone, Copy, Serialize)]
 struct CacheControl {
     #[serde(rename = "type")]
     kind: &'static str,
+    /// Retention window: omitted for `Standard` (the default window), `"1h"`
+    /// for `Extended`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
 }
 
-/// The `cache_control` marker a [`CachePolicy`] places, or `None` for
-/// [`Off`](CachePolicy::Off), which leaves the request unmarked.
+/// The wire shaping a non-`Off` [`CachePolicy`] applies: the `cache_control`
+/// marker its breakpoints carry, and the `anthropic-beta` flag (if any) that
+/// marker requires.
 ///
-/// A non-`Off` policy marks its breakpoints with the `ephemeral` marker; the
-/// retention shaping is derived from the one policy value so body and header
-/// cannot drift.
-fn cache_marker(policy: CachePolicy) -> Option<CacheControl> {
+/// Both fall out of the one policy value, so the body marker and the header
+/// flag cannot drift out of step: an `Extended` marker and its beta are emitted
+/// together or not at all.
+#[derive(Debug, Clone, Copy)]
+struct CacheShaping {
+    marker: CacheControl,
+    beta: Option<&'static str>,
+}
+
+/// The [`CacheShaping`] a [`CachePolicy`] applies, or `None` for
+/// [`Off`](CachePolicy::Off), which leaves the request unmarked.
+fn cache_shaping(policy: CachePolicy) -> Option<CacheShaping> {
     match policy {
         CachePolicy::Off => None,
-        // Standard places the bare ephemeral marker. Extended shares it for now:
-        // its longer-retention `ttl` and the beta header it needs are not wired
-        // yet, so it caches with Standard's shaping rather than doing nothing.
-        CachePolicy::Standard | CachePolicy::Extended => {
-            Some(CacheControl { kind: "ephemeral" })
+        // Standard places the bare ephemeral marker; base prompt caching is GA,
+        // so it needs no beta header.
+        CachePolicy::Standard => Some(CacheShaping {
+            marker: CacheControl {
+                kind: "ephemeral",
+                ttl: None,
+            },
+            beta: None,
+        }),
+        // Extended asks for the 1h window and merges the beta the window needs.
+        CachePolicy::Extended => Some(CacheShaping {
+            marker: CacheControl {
+                kind: "ephemeral",
+                ttl: Some("1h"),
+            },
+            beta: Some(EXTENDED_CACHE_BETA),
+        }),
+    }
+}
+
+/// Merge an `anthropic-beta` flag into a header list, appending to an existing
+/// `anthropic-beta` value comma-joined rather than replacing it, so the OAuth
+/// lane's required flags survive. Adds the header when none is present, and is a
+/// no-op when the flag is already listed.
+fn merge_anthropic_beta(headers: &mut Vec<(String, String)>, flag: &str) {
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name == "anthropic-beta")
+    {
+        Some((_, value)) => {
+            if !value.split(',').any(|existing| existing == flag) {
+                value.push(',');
+                value.push_str(flag);
+            }
         }
+        None => headers.push(("anthropic-beta".to_owned(), flag.to_owned())),
     }
 }
 
@@ -755,7 +809,7 @@ impl<'a> WireRequest<'a> {
         // skipping any that are absent: the last tool, the last system block,
         // and the final block of the last message. Marking promotes only the
         // affected block to the array form; every other message stays compact.
-        if let Some(marker) = cache_marker(opts.cache) {
+        if let Some(marker) = cache_shaping(opts.cache).map(|s| s.marker) {
             if let Some(tool) = tools.last_mut() {
                 tool.cache_control = Some(marker);
             }
@@ -2497,5 +2551,94 @@ mod tests {
         .unwrap();
         assert_eq!(body["system"][0]["text"], CLAUDE_CODE_IDENTITY);
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[tokio::test]
+    async fn extended_marks_the_three_breakpoints_with_1h_and_merges_beta() {
+        let opts = opts().with_cache(CachePolicy::Extended);
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+        provider
+            .complete(&cacheable_context(), &opts)
+            .await
+            .unwrap();
+
+        let sent = mock.last_request();
+        let body: serde_json::Value =
+            serde_json::from_slice(sent.body.as_deref().unwrap()).unwrap();
+
+        // All three breakpoints carry the ephemeral marker with the 1h ttl.
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(body["system"][0]["text"], "Be terse.");
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["text"], "Hi");
+        assert_eq!(content[0]["cache_control"]["ttl"], "1h");
+        // The api-key lane has no prior beta, so the flag is added on its own.
+        assert!(sent.headers.iter().any(|(k, v)| k == "anthropic-beta"
+            && v == EXTENDED_CACHE_BETA));
+    }
+
+    #[tokio::test]
+    async fn extended_merges_beta_onto_oauth_flags_without_dropping_them() {
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = oauth_provider(mock.clone());
+        let ctx =
+            Context::new(vec![Message::user("Hi")]).with_system("Be terse.");
+        provider
+            .complete(&ctx, &opts().with_cache(CachePolicy::Extended))
+            .await
+            .unwrap();
+
+        let sent = mock.last_request();
+        let body: serde_json::Value =
+            serde_json::from_slice(sent.body.as_deref().unwrap()).unwrap();
+
+        // The caller's block (last on the OAuth lane) carries the 1h marker.
+        assert_eq!(body["system"][1]["text"], "Be terse.");
+        assert_eq!(body["system"][1]["cache_control"]["ttl"], "1h");
+        // A single anthropic-beta carries the OAuth flags and the cache flag,
+        // merged rather than replaced.
+        let beta: Vec<&str> = sent
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "anthropic-beta")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(beta.len(), 1);
+        let expected = format!("{ANTHROPIC_OAUTH_BETA},{EXTENDED_CACHE_BETA}");
+        assert_eq!(beta[0], expected);
+    }
+
+    #[tokio::test]
+    async fn extended_off_still_emits_no_cache_beta() {
+        // Off leaves the request unmarked and adds no beta on the api-key lane.
+        let mock = std::sync::Arc::new(MockHttpClient::with_response(
+            200,
+            SAMPLE_RESPONSE,
+        ));
+        let provider = AnthropicProvider::new(
+            mock.clone(),
+            Credential::api_key("sk-test"),
+            "claude-3-5-sonnet",
+        );
+        provider
+            .complete(&cacheable_context(), &opts())
+            .await
+            .unwrap();
+
+        let sent = mock.last_request();
+        assert!(!sent.headers.iter().any(|(k, _)| k == "anthropic-beta"));
     }
 }
