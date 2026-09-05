@@ -50,6 +50,10 @@
 #[cfg(any(feature = "anthropic", feature = "openai"))]
 mod base64;
 
+/// The runtime [`ModelRegistry`] holding the Catalog and turning a Model Entry
+/// into a live Provider.
+#[cfg(feature = "models")]
+pub mod catalog;
 pub mod credential;
 pub mod embedding;
 pub mod error;
@@ -69,6 +73,8 @@ pub mod token_store;
 #[cfg(feature = "test-utils")]
 pub mod vcr;
 
+#[cfg(feature = "models")]
+pub use catalog::{ModelRegistry, create_provider};
 pub use credential::{Credential, OAuthTokens};
 pub use embedding::{EmbeddingProvider, EmbeddingRequest, EmbeddingResponse};
 pub use error::{Error, ErrorKind};
