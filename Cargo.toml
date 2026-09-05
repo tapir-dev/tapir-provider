@@ -31,6 +31,9 @@ openai = []
 # newtypes are always compiled because the Registry's ProviderInfo carries a
 # ProviderId regardless of this feature.
 models = []
+# User-supplied override layer for the catalog: a TOML file, highest precedence
+# in the Catalog merge (user > fetched > baseline). Requires `models`.
+models-user-config = ["models", "dep:toml"]
 # File-backed Token Store that serializes Credentials as TOML, guarded by an
 # OS file lock so concurrent processes coordinate reads, writes, and refresh.
 token-store-file = ["dep:toml", "dep:fs4"]

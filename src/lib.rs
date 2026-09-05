@@ -73,6 +73,8 @@ pub mod token_store;
 #[cfg(feature = "test-utils")]
 pub mod vcr;
 
+#[cfg(feature = "models-user-config")]
+pub use catalog::user_config_path;
 #[cfg(feature = "models")]
 pub use catalog::{ModelRegistry, create_provider};
 pub use credential::{Credential, OAuthTokens};

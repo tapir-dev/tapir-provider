@@ -5,12 +5,13 @@
 //!
 //! Where the [`Registry`] is a zero-sized, compile-time handle over Provider
 //! identity, the Model Registry is a stateful, owned object. It
-//! [`load`](ModelRegistry::load)s the layers of the Catalog — today just the
-//! compiled-in baseline — resolves each entry's Credential through the same
-//! Token Store / environment precedence every construction path uses, and turns
-//! a [`ModelEntry`] into a live `Arc<dyn Provider>` via
-//! [`create_provider`]. The common path is one call:
-//! `ModelRegistry::load(auth, None).create_provider("openai", "gpt-4o-mini", http)?`.
+//! [`load`](ModelRegistry::load)s the layers of the Catalog — the compiled-in
+//! baseline and, behind `models-user-config`, a user-override TOML layer merged
+//! over it — resolves each entry's Credential through the same Token Store /
+//! environment precedence every construction path uses, and turns a
+//! [`ModelEntry`] into a live `Arc<dyn Provider>` via [`create_provider`]. The
+//! common path is one call:
+//! `ModelRegistry::load(auth, None)?.create_provider("openai", "gpt-4o-mini", http)?`.
 //!
 //! A [`ModelEntry`] carries only an API-key Credential ([`ModelEntry::api_key`]),
 //! so `load` folds a resolved API key into the entry and an OAuth Credential is
@@ -19,6 +20,11 @@
 //! [`available_models`](ModelRegistry::available_models).
 
 mod baseline;
+#[cfg(feature = "models-user-config")]
+mod user_config;
+
+#[cfg(feature = "models-user-config")]
+pub use user_config::default_path as user_config_path;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,33 +50,48 @@ pub struct ModelRegistry {
 impl ModelRegistry {
     /// Load the Catalog and resolve each entry's Credential.
     ///
-    /// The compiled-in baseline layer is loaded, then every entry without an
-    /// API key already set has one resolved by precedence: the `auth` Token
-    /// Store under the entry's Provider id, else that Provider's default API-key
-    /// environment variable. Resolution never fails the load — a broken store or
-    /// an OAuth-only Credential simply leaves the entry without a key, so it is
-    /// present in [`models`](Self::models) but not in
+    /// The compiled-in baseline layer is loaded first. When the
+    /// `models-user-config` feature is on and `models_path` names an existing
+    /// file, its TOML user-override layer is merged over the baseline (user
+    /// value winning) before Credentials are resolved; a `None` path or a path
+    /// with no file leaves the baseline untouched. Callers discover the
+    /// conventional path with [`user_config_path`].
+    ///
+    /// Every entry without an API key already set then has one resolved by
+    /// precedence: the `auth` Token Store under the entry's Provider id, else
+    /// that Provider's default API-key environment variable. Credential
+    /// resolution never fails the load — a broken store or an OAuth-only
+    /// Credential simply leaves the entry without a key, so it is present in
+    /// [`models`](Self::models) but not in
     /// [`available_models`](Self::available_models).
     ///
-    /// `models_path` is where the user-override and fetched layers live; those
-    /// layers sit behind their own features and are not loaded yet, so the path
-    /// is retained ([`models_path`](Self::models_path)) for when they land.
-    #[must_use]
+    /// # Errors
+    ///
+    /// Only the user-override layer can fail the load, and only when the
+    /// `models-user-config` feature is on: an unreadable file, malformed TOML,
+    /// an aliased or duplicate Provider key, or a new Model missing a required
+    /// field. Without that feature, or with no user file, `load` never fails.
     pub fn load(
         auth: Option<&dyn TokenStore>,
         models_path: Option<PathBuf>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let mut entries = baseline::entries();
+        #[cfg(feature = "models-user-config")]
+        if let Some(path) = models_path.as_deref()
+            && let Some(raw) = read_user_config(path)?
+        {
+            user_config::apply(&mut entries, &raw)?;
+        }
         for entry in &mut entries {
             if entry.api_key.is_some() {
                 continue;
             }
             entry.api_key = resolve_api_key(entry, auth);
         }
-        Self {
+        Ok(Self {
             entries,
             models_path,
-        }
+        })
     }
 
     /// Every entry in the Catalog, whether or not it has a resolved Credential.
@@ -154,11 +175,28 @@ impl ModelRegistry {
     }
 }
 
+/// Read the user-override file, or `None` when it does not exist.
+///
+/// A missing file is the common case — most callers have no user layer — so it
+/// is not an error; any other I/O failure is.
+#[cfg(feature = "models-user-config")]
+fn read_user_config(path: &Path) -> Result<Option<String>, Error> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Error::new(
+            ErrorKind::Other,
+            format!("read user model config {}: {err}", path.display()),
+        )
+        .with_source(err)),
+    }
+}
+
 /// Resolve a baseline entry's API key from the Token Store or environment.
 ///
 /// Returns the key only when resolution yields an API-key Credential; an OAuth
 /// Credential (which a [`ModelEntry`] cannot carry) and every failure map to
-/// `None`, so [`ModelRegistry::load`] stays infallible.
+/// `None`, so Credential resolution never fails a load.
 fn resolve_api_key(
     entry: &ModelEntry,
     auth: Option<&dyn TokenStore>,
@@ -260,7 +298,7 @@ mod tests {
 
     #[test]
     fn load_carries_the_baseline_entries() {
-        let registry = ModelRegistry::load(None, None);
+        let registry = ModelRegistry::load(None, None).unwrap();
         // With no Credential source, entries are present but none is available.
         assert_eq!(registry.models().len(), registry.entries.len());
         assert!(registry.available_models().is_empty());
@@ -268,10 +306,91 @@ mod tests {
 
     #[test]
     fn models_path_round_trips() {
+        // A path with no file leaves the baseline untouched and is retained.
+        let path = PathBuf::from("/nonexistent/tapir/models.toml");
+        let registry = ModelRegistry::load(None, Some(path.clone())).unwrap();
+        assert_eq!(registry.models_path(), Some(path.as_path()));
+        assert_eq!(
+            ModelRegistry::load(None, None).unwrap().models_path(),
+            None
+        );
+    }
+}
+
+// The user-override layer, exercised end to end through `load`: a real file on
+// disk must surface through `models()`. Needs a Provider to have a baseline to
+// override; `openai` supplies one.
+#[cfg(all(test, feature = "models-user-config", feature = "openai"))]
+mod user_config_tests {
+    use super::*;
+
+    /// A models.toml written to a unique temp path, removed on drop.
+    struct TempConfig {
+        path: PathBuf,
+    }
+
+    impl TempConfig {
+        fn write(contents: &str) -> Self {
+            let name = format!(
+                "tapir-models-{}-{:?}.toml",
+                std::process::id(),
+                std::thread::current().id()
+            );
+            let path = std::env::temp_dir().join(name);
+            std::fs::write(&path, contents).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn a_user_file_overrides_and_adds_models() {
+        let config = TempConfig::write(
+            r#"
+            [providers.openai]
+            base_url = "https://house.internal"
+
+            [[providers.openai.models]]
+            id = "gpt-4o-mini"
+            max_tokens = 99999
+
+            [[providers.openai.models]]
+            id = "gpt-house"
+            name = "House Model"
+            api = "openai-completions"
+            context_window = 64000
+            max_tokens = 8192
+            "#,
+        );
+
         let registry =
-            ModelRegistry::load(None, Some(PathBuf::from("/tmp/models.json")));
-        assert_eq!(registry.models_path(), Some(Path::new("/tmp/models.json")));
-        assert_eq!(ModelRegistry::load(None, None).models_path(), None);
+            ModelRegistry::load(None, Some(config.path.clone())).unwrap();
+
+        // The override reached the existing baseline Model.
+        let overridden = registry.find("openai", "gpt-4o-mini").unwrap();
+        assert_eq!(overridden.model.max_tokens, 99999);
+        // The added Model surfaces through `models()`.
+        let added = registry.find("openai", "gpt-house").unwrap();
+        assert_eq!(added.model.name, "House Model");
+        assert!(
+            registry
+                .models()
+                .iter()
+                .any(|entry| entry.model.id.as_str() == "gpt-house")
+        );
+    }
+
+    #[test]
+    fn a_broken_user_file_fails_the_load() {
+        let config = TempConfig::write("this is = = not toml");
+        let err =
+            ModelRegistry::load(None, Some(config.path.clone())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Decode);
     }
 }
 
@@ -282,7 +401,7 @@ mod openai_tests {
 
     #[test]
     fn find_locates_a_baseline_model_by_provider_and_alias() {
-        let registry = ModelRegistry::load(None, None);
+        let registry = ModelRegistry::load(None, None).unwrap();
         assert!(registry.find("openai", "gpt-4o-mini").is_some());
         // The `gpt` alias resolves to the same entry.
         assert!(registry.find("gpt", "gpt-4o-mini").is_some());
@@ -292,7 +411,7 @@ mod openai_tests {
 
     #[test]
     fn find_by_id_matches_across_providers() {
-        let registry = ModelRegistry::load(None, None);
+        let registry = ModelRegistry::load(None, None).unwrap();
         let entry = registry.find_by_id("gpt-4o-mini").unwrap();
         assert_eq!(entry.model.provider.as_str(), "openai");
     }
@@ -303,7 +422,7 @@ mod openai_tests {
         store
             .set("openai", Credential::api_key("sk-openai"))
             .unwrap();
-        let registry = ModelRegistry::load(Some(&store), None);
+        let registry = ModelRegistry::load(Some(&store), None).unwrap();
 
         let available = registry.available_models();
         assert!(
@@ -339,7 +458,7 @@ mod openai_build_tests {
         store
             .set("openai", Credential::api_key("sk-openai"))
             .unwrap();
-        let registry = ModelRegistry::load(Some(&store), None);
+        let registry = ModelRegistry::load(Some(&store), None).unwrap();
         let http =
             Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
 
@@ -366,7 +485,7 @@ mod openai_build_tests {
     #[test]
     fn create_provider_without_a_credential_is_an_auth_error() {
         // No Credential source, so the entry resolves no key.
-        let registry = ModelRegistry::load(None, None);
+        let registry = ModelRegistry::load(None, None).unwrap();
         let entry = registry.find("openai", "gpt-4o-mini").unwrap();
         let http = Arc::new(MockHttpClient::new());
 
@@ -379,7 +498,7 @@ mod openai_build_tests {
 
     #[test]
     fn selecting_an_unknown_model_fails_cleanly() {
-        let registry = ModelRegistry::load(None, None);
+        let registry = ModelRegistry::load(None, None).unwrap();
         let http = Arc::new(MockHttpClient::new());
         let Err(err) =
             registry.create_provider("openai", "does-not-exist", http)
@@ -399,7 +518,7 @@ mod empty_tests {
 
     #[test]
     fn no_provider_feature_yields_an_empty_catalog() {
-        let registry = ModelRegistry::load(None, None);
+        let registry = ModelRegistry::load(None, None).unwrap();
         assert!(registry.models().is_empty());
         assert!(registry.find_by_id("gpt-4o-mini").is_none());
     }
