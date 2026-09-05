@@ -1,22 +1,16 @@
 // SPDX-License-Identifier: ISC
 // SPDX-FileCopyrightText: 2026 Murilo Ijanc' <murilo@ijanc.org>
 
-//! The [`Registry`]: the compiled-in catalog of available [`Provider`]s.
+//! The [`Registry`]: the compiled-in catalog of available [`Provider`](crate::Provider)s.
 //!
 //! Only entries whose Cargo feature is enabled are present, so the default
-//! build ships none and building any Provider by name fails cleanly. A caller
-//! selects a Provider by name — its canonical id or an alias — and
-//! [`Registry::build`] turns that name plus a Model, a Credential, and a
-//! transport into an `Arc<dyn Provider>`, resolving the Credential from the
-//! argument or the Provider's default API-key environment variable.
+//! build ships none. A caller selects a Provider by name — its canonical id or
+//! an alias — and [`Registry::resolve`] answers which [`ProviderInfo`] that name
+//! picks. Turning a selection into a live Provider is the Model Registry's job,
+//! not the Registry's: the Registry carries only Provider identity and
+//! selection.
 
-use std::sync::Arc;
-
-use crate::credential::Credential;
-use crate::error::{Error, ErrorKind};
-use crate::http::HttpClient;
 use crate::model::ProviderId;
-use crate::provider::Provider;
 
 /// A compiled-in Provider's identity in the [`Registry`].
 ///
@@ -58,7 +52,7 @@ const ENTRIES: &[ProviderInfo] = &[
     crate::providers::openai::INFO,
 ];
 
-/// The compiled-in catalog of available [`Provider`]s.
+/// The compiled-in catalog of available [`Provider`](crate::Provider)s.
 ///
 /// A zero-sized handle over the feature-gated entry table; all its operations
 /// are associated functions.
@@ -84,91 +78,11 @@ impl Registry {
     pub fn resolve(name: &str) -> Option<&'static ProviderInfo> {
         ENTRIES.iter().find(|info| info.matches(name))
     }
-
-    /// Build the Provider selected by `name` over the injected `transport`.
-    ///
-    /// `name` is a canonical id or an alias. The Credential is resolved by
-    /// precedence: the explicit `credential` if `Some`, else the Provider's
-    /// default API-key environment variable ([`ProviderInfo::api_key_env`]). A
-    /// name that no compiled-in Provider matches is an
-    /// [`InvalidRequest`](crate::ErrorKind::InvalidRequest) error; a Provider
-    /// that resolves no Credential is an
-    /// [`Authentication`](crate::ErrorKind::Authentication) error.
-    pub fn build<H: HttpClient + 'static>(
-        name: &str,
-        model: impl Into<String>,
-        credential: Option<Credential>,
-        transport: H,
-    ) -> Result<Arc<dyn Provider>, Error> {
-        let info = Self::resolve(name).ok_or_else(|| unknown_provider(name))?;
-
-        // Resolve the Credential at the selection boundary so the entry's
-        // `api_key_env` is what actually names the fallback variable: the
-        // explicit argument wins, else that environment variable. A Provider's
-        // own `resolve` then receives the already-chosen Credential.
-        let credential = crate::token_store::resolve(
-            credential,
-            None,
-            info.id.as_str(),
-            info.api_key_env,
-        )?;
-
-        #[cfg(feature = "anthropic")]
-        if info.id == crate::providers::anthropic::INFO.id {
-            let provider = crate::providers::AnthropicProvider::resolve(
-                transport, model, credential, None,
-            )?;
-            return Ok(Arc::new(provider));
-        }
-
-        #[cfg(feature = "openai")]
-        if info.id == crate::providers::openai::INFO.id {
-            let provider = crate::providers::OpenAIProvider::resolve(
-                transport, model, credential, None,
-            )?;
-            return Ok(Arc::new(provider));
-        }
-
-        // `resolve` only ever returns a compiled-in entry, and every such entry
-        // has a construction arm above; reaching here would be one added without
-        // its arm. The bindings are consumed here so a no-Provider build (where
-        // the arms above vanish and `resolve` always returns `None`) still type-
-        // checks without unused-variable warnings.
-        let _ = (info, model, credential, transport);
-        Err(unknown_provider(name))
-    }
 }
 
-/// An [`InvalidRequest`](ErrorKind::InvalidRequest) error naming the Providers
-/// this build actually offers, so a caller who selects a missing one — often a
-/// Provider whose feature is off — learns what is available.
-fn unknown_provider(name: &str) -> Error {
-    let available = Registry::provider_ids();
-    let message = if available.is_empty() {
-        format!(
-            "unknown provider {name:?}: no provider features are enabled in this build"
-        )
-    } else {
-        format!(
-            "unknown provider {name:?}; available: {}",
-            available.join(", ")
-        )
-    };
-    Error::new(ErrorKind::InvalidRequest, message)
-}
-
-#[cfg(all(test, feature = "anthropic", feature = "test-utils"))]
+#[cfg(all(test, feature = "anthropic"))]
 mod anthropic_tests {
     use super::*;
-    use crate::http::MockHttpClient;
-    use crate::message::Message;
-    use crate::request::CompletionRequest;
-
-    const SAMPLE_RESPONSE: &str = r#"{
-        "content": [{"type": "text", "text": "hi"}],
-        "stop_reason": "end_turn",
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    }"#;
 
     #[test]
     fn anthropic_is_compiled_in_and_resolves_by_id_and_alias() {
@@ -198,84 +112,11 @@ mod anthropic_tests {
     fn an_unknown_name_does_not_resolve() {
         assert!(Registry::resolve("does-not-exist").is_none());
     }
-
-    #[tokio::test]
-    async fn builds_anthropic_by_name_and_completes() {
-        let http =
-            Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
-        let provider = Registry::build(
-            "anthropic",
-            "claude-3-5-sonnet",
-            Some(Credential::api_key("sk-test")),
-            http,
-        )
-        .unwrap();
-
-        let response = provider
-            .complete(CompletionRequest::new(vec![Message::user("hello")]))
-            .await
-            .unwrap();
-        assert_eq!(response.text, "hi");
-    }
-
-    #[tokio::test]
-    async fn builds_anthropic_through_its_alias() {
-        let http =
-            Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
-        let provider = Registry::build(
-            "claude",
-            "claude-3-5-sonnet",
-            Some(Credential::api_key("sk-test")),
-            http.clone(),
-        )
-        .unwrap();
-
-        provider
-            .complete(CompletionRequest::new(vec![Message::user("hello")]))
-            .await
-            .unwrap();
-        // The resolved API key reached the wire under the anthropic lane.
-        assert!(
-            http.last_request()
-                .headers
-                .iter()
-                .any(|(k, v)| k == "x-api-key" && v == "sk-test")
-        );
-    }
-
-    #[test]
-    fn building_an_unknown_provider_fails_cleanly() {
-        let http = Arc::new(MockHttpClient::new());
-        // A name no compiled-in Provider claims, whatever features are on.
-        // `Arc<dyn Provider>` is not `Debug`, so match rather than `unwrap_err`.
-        let Err(err) = Registry::build(
-            "cohere",
-            "command",
-            Some(Credential::api_key("sk-test")),
-            http,
-        ) else {
-            panic!("an unknown provider must not build");
-        };
-        assert_eq!(err.kind(), ErrorKind::InvalidRequest);
-        assert!(err.message().contains("cohere"));
-    }
 }
 
-#[cfg(all(test, feature = "openai", feature = "test-utils"))]
+#[cfg(all(test, feature = "openai"))]
 mod openai_tests {
     use super::*;
-    use crate::http::MockHttpClient;
-    use crate::message::Message;
-    use crate::request::CompletionRequest;
-
-    const SAMPLE_RESPONSE: &str = r#"{
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "hi"},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-    }"#;
 
     #[test]
     fn openai_is_compiled_in_and_resolves_by_id_and_alias() {
@@ -287,32 +128,6 @@ mod openai_tests {
         assert_eq!(
             Registry::resolve("openai").unwrap().api_key_env,
             "OPENAI_API_KEY"
-        );
-    }
-
-    #[tokio::test]
-    async fn builds_openai_by_name_and_completes() {
-        let http =
-            Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
-        let provider = Registry::build(
-            "openai",
-            "gpt-4o-mini",
-            Some(Credential::api_key("sk-test")),
-            http.clone(),
-        )
-        .unwrap();
-
-        let response = provider
-            .complete(CompletionRequest::new(vec![Message::user("hello")]))
-            .await
-            .unwrap();
-        assert_eq!(response.text, "hi");
-        // The resolved key reached the wire on the Bearer lane.
-        assert!(
-            http.last_request()
-                .headers
-                .iter()
-                .any(|(k, v)| k == "authorization" && v == "Bearer sk-test")
         );
     }
 }
@@ -332,10 +147,9 @@ mod registration_tests {
     }
 }
 
-// A build with no Provider feature enabled: the Registry is empty and building
-// any Provider by name fails cleanly. Only reachable when every Provider feature
-// is off, so the default `--all-features` test run skips it; a
-// `--no-default-features` run exercises it.
+// A build with no Provider feature enabled: the Registry is empty and no name
+// resolves. Only reachable when every Provider feature is off, so the default
+// `--all-features` test run skips it; a `--no-default-features` run exercises it.
 #[cfg(all(test, not(any(feature = "anthropic", feature = "openai"))))]
 mod empty_tests {
     use super::*;
