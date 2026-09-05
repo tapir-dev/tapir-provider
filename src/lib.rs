@@ -64,6 +64,9 @@ pub mod retry;
 pub mod sse;
 pub mod stream;
 pub mod token_store;
+/// Record/replay cassette test layer over the [`HttpClient`] transport seam.
+#[cfg(feature = "test-utils")]
+pub mod vcr;
 
 pub use credential::{Credential, OAuthTokens};
 pub use embedding::{EmbeddingProvider, EmbeddingRequest, EmbeddingResponse};
@@ -80,6 +83,8 @@ pub use stream::{StreamAccumulator, StreamEvent, StreamEvents};
 #[cfg(feature = "token-store-file")]
 pub use token_store::{DEFAULT_REFRESH_WINDOW_SECS, FileTokenStore};
 pub use token_store::{InMemoryTokenStore, Refresh, TokenStore, resolve};
+#[cfg(feature = "test-utils")]
+pub use vcr::{Redactor, VcrClient, VcrMode};
 
 #[cfg(feature = "anthropic")]
 pub use providers::anthropic::oauth::{
