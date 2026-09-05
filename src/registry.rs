@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::credential::Credential;
 use crate::error::{Error, ErrorKind};
 use crate::http::HttpClient;
+use crate::model::ProviderId;
 use crate::provider::Provider;
 
 /// A compiled-in Provider's identity in the [`Registry`].
@@ -23,10 +24,10 @@ use crate::provider::Provider;
 /// under in a Token Store), the alternate `aliases` that also select it, and the
 /// `api_key_env` environment variable holding its default API key. Name matching
 /// against the id and aliases is ASCII-case-insensitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderInfo {
     /// The canonical Provider id (also its Token Store key).
-    pub id: &'static str,
+    pub id: ProviderId,
     /// Alternate names that select this Provider.
     pub aliases: &'static [&'static str],
     /// The environment variable holding this Provider's default API key.
@@ -38,7 +39,7 @@ impl ProviderInfo {
     /// compared ASCII-case-insensitively.
     #[must_use]
     pub fn matches(&self, name: &str) -> bool {
-        self.id.eq_ignore_ascii_case(name)
+        self.id.as_str().eq_ignore_ascii_case(name)
             || self
                 .aliases
                 .iter()
@@ -74,7 +75,7 @@ impl Registry {
     /// The canonical id of every Provider compiled into this build.
     #[must_use]
     pub fn provider_ids() -> Vec<&'static str> {
-        ENTRIES.iter().map(|info| info.id).collect()
+        ENTRIES.iter().map(|info| info.id.as_str()).collect()
     }
 
     /// The [`ProviderInfo`] a `name` selects — its canonical id or an alias — or
@@ -108,7 +109,7 @@ impl Registry {
         let credential = crate::token_store::resolve(
             credential,
             None,
-            info.id,
+            info.id.as_str(),
             info.api_key_env,
         )?;
 
@@ -172,11 +173,20 @@ mod anthropic_tests {
     #[test]
     fn anthropic_is_compiled_in_and_resolves_by_id_and_alias() {
         assert!(Registry::provider_ids().contains(&"anthropic"));
-        assert_eq!(Registry::resolve("anthropic").unwrap().id, "anthropic");
+        assert_eq!(
+            Registry::resolve("anthropic").unwrap().id.as_str(),
+            "anthropic"
+        );
         // The `claude` alias selects the same Provider...
-        assert_eq!(Registry::resolve("claude").unwrap().id, "anthropic");
+        assert_eq!(
+            Registry::resolve("claude").unwrap().id.as_str(),
+            "anthropic"
+        );
         // ...and matching is case-insensitive.
-        assert_eq!(Registry::resolve("Anthropic").unwrap().id, "anthropic");
+        assert_eq!(
+            Registry::resolve("Anthropic").unwrap().id.as_str(),
+            "anthropic"
+        );
         // The entry exposes the default API-key environment variable.
         assert_eq!(
             Registry::resolve("anthropic").unwrap().api_key_env,
@@ -270,10 +280,10 @@ mod openai_tests {
     #[test]
     fn openai_is_compiled_in_and_resolves_by_id_and_alias() {
         assert!(Registry::provider_ids().contains(&"openai"));
-        assert_eq!(Registry::resolve("openai").unwrap().id, "openai");
+        assert_eq!(Registry::resolve("openai").unwrap().id.as_str(), "openai");
         // The `gpt` alias selects the same Provider, case-insensitively.
-        assert_eq!(Registry::resolve("gpt").unwrap().id, "openai");
-        assert_eq!(Registry::resolve("OpenAI").unwrap().id, "openai");
+        assert_eq!(Registry::resolve("gpt").unwrap().id.as_str(), "openai");
+        assert_eq!(Registry::resolve("OpenAI").unwrap().id.as_str(), "openai");
         assert_eq!(
             Registry::resolve("openai").unwrap().api_key_env,
             "OPENAI_API_KEY"

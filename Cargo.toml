@@ -16,6 +16,11 @@ reqwest = ["dep:reqwest"]
 anthropic = ["dep:getrandom"]
 # Compile the OpenAI Provider and embeddings into the crate.
 openai = []
+# Umbrella feature for the model catalog's type layer: Model, Model Entry,
+# Compat, and the catalog enums. Off by default; the ModelId/ProviderId
+# newtypes are always compiled because the Registry's ProviderInfo carries a
+# ProviderId regardless of this feature.
+models = []
 # File-backed Token Store that serializes Credentials as TOML, guarded by an
 # OS file lock so concurrent processes coordinate reads, writes, and refresh.
 token-store-file = ["dep:toml", "dep:fs4"]

@@ -55,6 +55,7 @@ pub mod embedding;
 pub mod error;
 pub mod http;
 pub mod message;
+pub mod model;
 pub mod provider;
 pub mod providers;
 pub mod registry;
@@ -73,6 +74,12 @@ pub use embedding::{EmbeddingProvider, EmbeddingRequest, EmbeddingResponse};
 pub use error::{Error, ErrorKind};
 pub use http::{ByteStream, HttpClient, HttpRequest, HttpResponse, Method};
 pub use message::{ContentPart, ImageSource, MediaType, Message, Role};
+#[cfg(feature = "models")]
+pub use model::{
+    Api, CompatConfig, Dialect, InputType, Model, ModelCost, ModelEntry,
+    ThinkingLevel,
+};
+pub use model::{ModelId, ProviderId};
 pub use provider::Provider;
 pub use registry::{ProviderInfo, Registry};
 pub use request::{CompletionRequest, ToolChoice, ToolDefinition};

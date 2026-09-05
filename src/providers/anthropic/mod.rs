@@ -39,7 +39,7 @@ pub(crate) const ALIASES: &[&str] = &["claude"];
 /// id, the alternate names that select it, and the environment variable holding
 /// its default API key.
 pub const INFO: crate::registry::ProviderInfo = crate::registry::ProviderInfo {
-    id: PROVIDER_KEY,
+    id: crate::model::ProviderId::from_static(PROVIDER_KEY),
     aliases: ALIASES,
     api_key_env: API_KEY_ENV,
 };
