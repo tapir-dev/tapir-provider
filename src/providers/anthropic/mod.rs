@@ -1,34 +1,29 @@
 // SPDX-License-Identifier: ISC
 // SPDX-FileCopyrightText: 2026 Murilo Ijanc' <murilo@ijanc.org>
 
-//! The Anthropic [`Provider`], authenticating with an `x-api-key` or an OAuth
-//! `Bearer` Credential.
+//! The Anthropic [`Provider`](crate::Provider), authenticating with an
+//! `x-api-key` or an OAuth `Bearer` Credential.
 
 pub mod oauth;
 
 use crate::credential::Credential;
-use crate::error::{Error, ErrorKind};
-use crate::http::HttpClient;
+use crate::error::Error;
 use crate::message::{
     AssistantMessage, ContentPart, ImageSource, Message, ToolResultMessage,
 };
 use crate::pipeline::{
-    CompletionPipeline, Streaming, WireAdapter, redacted_headers,
+    CompletionBuilder, CompletionPipeline, Streaming, WireAdapter,
 };
-use crate::provider::Provider;
 use crate::request::{
     CachePolicy, CompletionOptions, Context, SystemPrompt, ThinkingLevel,
     ToolChoice, ToolDefinition,
 };
 use crate::response::{FinishReason, Usage, mint_call_id};
 use crate::sse::SseEvent;
-use crate::stream::{StreamEvent, StreamEvents, StreamNormalizer};
-use crate::token_store::{TokenStore, resolve};
-use async_trait::async_trait;
+use crate::stream::{StreamEvent, StreamNormalizer};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 
 /// Default base URL for the Anthropic API.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -42,11 +37,11 @@ pub(crate) const ALIASES: &[&str] = &["claude"];
 /// This Provider's identity in the [`Registry`](crate::Registry): its canonical
 /// id, the alternate names that select it, and the environment variable holding
 /// its default API key.
-pub const INFO: crate::registry::ProviderInfo = crate::registry::ProviderInfo {
-    id: crate::model::ProviderId::from_static(PROVIDER_KEY),
-    aliases: ALIASES,
-    api_key_env: API_KEY_ENV,
-};
+///
+/// Sourced from the adapter's [`WireAdapter::INFO`], the one place the identity
+/// is written, so the Registry entry and the wire cannot drift.
+pub const INFO: crate::registry::ProviderInfo =
+    <AnthropicWire as WireAdapter>::INFO;
 /// Anthropic API version header value pinned by this crate.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; use this when the request leaves it unset.
@@ -128,11 +123,21 @@ pub(crate) fn auth_headers(credential: &Credential) -> Vec<(String, String)> {
 /// retention requires. The pipeline owns everything invariant around these, so
 /// nothing else about the Anthropic wire lives outside this adapter.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct AnthropicWire;
+pub struct AnthropicWire;
 
 impl WireAdapter for AnthropicWire {
     type Response = WireResponse;
     type Normalizer = AnthropicStreamNormalizer;
+
+    const PROVIDER_KEY: &'static str = PROVIDER_KEY;
+    const API_KEY_ENV: &'static str = API_KEY_ENV;
+    const DEFAULT_BASE_URL: &'static str = DEFAULT_BASE_URL;
+    const DISPLAY_NAME: &'static str = "Anthropic";
+    const INFO: crate::registry::ProviderInfo = crate::registry::ProviderInfo {
+        id: crate::model::ProviderId::from_static(PROVIDER_KEY),
+        aliases: ALIASES,
+        api_key_env: API_KEY_ENV,
+    };
 
     fn endpoint(&self) -> &str {
         "/v1/messages"
@@ -188,212 +193,22 @@ impl WireAdapter for AnthropicWire {
 
 /// A Provider for Anthropic's Messages API.
 ///
-/// A newtype over the shared `CompletionPipeline` driving an `AnthropicWire`
-/// adapter: the pipeline carries the invariant send / success-gate / decode /
-/// stream-wrap flow and holds the Provider fields (transport `H`, Credential,
-/// Model, base URL, extra headers), while this type preserves the existing
-/// construction surface unchanged. It erases to `Arc<dyn Provider>` at
+/// A thin alias for the shared [`CompletionPipeline`] driving an
+/// [`AnthropicWire`] adapter: the pipeline carries the invariant send /
+/// success-gate / decode / stream-wrap flow and the construction surface
+/// (`new`, `resolve`, `builder`, `with_*`), reading Anthropic's identity off the
+/// adapter, while the adapter supplies only the wire specifics. It implements
+/// [`Provider`](crate::Provider) and erases to `Arc<dyn Provider>` at
 /// registration; the addressable Model is fixed when the Provider is built.
-#[derive(Clone, Debug)]
-pub struct AnthropicProvider<H>(CompletionPipeline<H, AnthropicWire>);
-
-impl<H: HttpClient> AnthropicProvider<H> {
-    /// Build a Provider for the given Model, authenticating with `credential`
-    /// over the injected transport.
-    ///
-    /// The explicit `credential` is resolution's top tier, so this routes it
-    /// through the same [`resolve`] rule every construction path uses: an
-    /// explicit argument never consults the store or environment, so this is
-    /// infallible.
-    pub fn new(
-        http: H,
-        credential: Credential,
-        model: impl Into<String>,
-    ) -> Self {
-        let credential =
-            resolve(Some(credential), None, PROVIDER_KEY, API_KEY_ENV)
-                .ok()
-                .flatten()
-                .expect("an explicit Credential always resolves");
-        Self(CompletionPipeline::new(
-            http,
-            AnthropicWire,
-            credential,
-            model,
-            DEFAULT_BASE_URL,
-        ))
-    }
-
-    /// Build a Provider by resolving its Credential from a Token Store, then
-    /// the `ANTHROPIC_API_KEY` environment variable.
-    ///
-    /// Precedence follows [`resolve`]: an `explicit` Credential wins, else the
-    /// `store` under this Provider's key, else the environment. When every tier
-    /// is empty this is an
-    /// [`Authentication`](crate::ErrorKind::Authentication) error rather than a
-    /// Provider that cannot authenticate any request.
-    pub fn resolve(
-        http: H,
-        model: impl Into<String>,
-        explicit: Option<Credential>,
-        store: Option<&dyn TokenStore>,
-    ) -> Result<Self, Error> {
-        let credential = resolve(explicit, store, PROVIDER_KEY, API_KEY_ENV)?
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Authentication,
-                    format!(
-                        "no Anthropic Credential: pass one, store it under {PROVIDER_KEY:?}, or set {API_KEY_ENV}"
-                    ),
-                )
-            })?;
-        Ok(Self::new(http, credential, model))
-    }
-
-    /// Start a typed [`AnthropicBuilder`] over the injected transport for the
-    /// given Model.
-    ///
-    /// The builder layers the advanced knobs — an explicit Credential, a
-    /// base-URL override, and extra headers — over the same Credential
-    /// resolution [`resolve`](Self::resolve) uses.
-    #[must_use]
-    pub fn builder(http: H, model: impl Into<String>) -> AnthropicBuilder<H> {
-        AnthropicBuilder::new(http, model)
-    }
-
-    /// Override the base URL (for proxies, gateways, or a test server).
-    #[must_use]
-    pub fn with_base_url(self, base_url: impl Into<String>) -> Self {
-        Self(self.0.with_base_url(base_url))
-    }
-
-    /// Append an extra header sent with every request, after the Provider's own
-    /// auth and version headers.
-    #[must_use]
-    pub fn with_header(
-        self,
-        name: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        Self(self.0.with_header(name, value))
-    }
-
-    /// Append extra headers sent with every request, after the Provider's own
-    /// auth and version headers.
-    #[must_use]
-    pub fn with_headers(
-        self,
-        headers: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
-        Self(self.0.with_headers(headers))
-    }
-}
+pub type AnthropicProvider<H> = CompletionPipeline<H, AnthropicWire>;
 
 /// A typed builder for an [`AnthropicProvider`] with advanced configuration.
 ///
-/// It gathers an injected transport, the Model, and the optional knobs — an
-/// explicit Credential, a base-URL override, and extra headers — then
-/// [`build`](Self::build)s a Provider, resolving the Credential through the same
-/// precedence [`AnthropicProvider::resolve`] uses (explicit, then the
-/// `ANTHROPIC_API_KEY` environment variable).
-#[derive(Clone)]
-pub struct AnthropicBuilder<H> {
-    http: H,
-    model: String,
-    credential: Option<Credential>,
-    base_url: Option<String>,
-    headers: Vec<(String, String)>,
-}
-
-impl<H: fmt::Debug> fmt::Debug for AnthropicBuilder<H> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AnthropicBuilder")
-            .field("http", &self.http)
-            .field("model", &self.model)
-            .field("credential", &self.credential)
-            .field("base_url", &self.base_url)
-            .field("headers", &redacted_headers(&self.headers))
-            .finish()
-    }
-}
-
-impl<H: HttpClient> AnthropicBuilder<H> {
-    /// Start a builder over the injected transport for the given Model.
-    #[must_use]
-    pub fn new(http: H, model: impl Into<String>) -> Self {
-        Self {
-            http,
-            model: model.into(),
-            credential: None,
-            base_url: None,
-            headers: Vec::new(),
-        }
-    }
-
-    /// Authenticate with an explicit Credential, the top tier of resolution.
-    #[must_use]
-    pub fn credential(mut self, credential: Credential) -> Self {
-        self.credential = Some(credential);
-        self
-    }
-
-    /// Override the base URL (for proxies, gateways, or a test server).
-    #[must_use]
-    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = Some(base_url.into());
-        self
-    }
-
-    /// Append an extra header sent with every request.
-    #[must_use]
-    pub fn header(
-        mut self,
-        name: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        self.headers.push((name.into(), value.into()));
-        self
-    }
-
-    /// Resolve the Credential and build the Provider.
-    ///
-    /// Credential precedence follows [`resolve`]: the explicit
-    /// [`credential`](Self::credential) if set, else the `ANTHROPIC_API_KEY`
-    /// environment variable. An empty result is an
-    /// [`Authentication`](crate::ErrorKind::Authentication) error.
-    pub fn build(self) -> Result<AnthropicProvider<H>, Error> {
-        let mut provider = AnthropicProvider::resolve(
-            self.http,
-            self.model,
-            self.credential,
-            None,
-        )?;
-        if let Some(base_url) = self.base_url {
-            provider = provider.with_base_url(base_url);
-        }
-        provider = provider.with_headers(self.headers);
-        Ok(provider)
-    }
-}
-
-#[async_trait]
-impl<H: HttpClient> Provider for AnthropicProvider<H> {
-    async fn complete(
-        &self,
-        ctx: &Context,
-        opts: &CompletionOptions,
-    ) -> Result<AssistantMessage, Error> {
-        self.0.complete(ctx, opts).await
-    }
-
-    async fn complete_stream(
-        &self,
-        ctx: &Context,
-        opts: &CompletionOptions,
-    ) -> Result<StreamEvents, Error> {
-        self.0.complete_stream(ctx, opts).await
-    }
-}
+/// A thin alias for the shared [`CompletionBuilder`] over an [`AnthropicWire`]
+/// adapter; it resolves the Credential through the same precedence
+/// [`AnthropicProvider::resolve`] uses (explicit, then the `ANTHROPIC_API_KEY`
+/// environment variable).
+pub type AnthropicBuilder<H> = CompletionBuilder<H, AnthropicWire>;
 
 /// Turns Anthropic's SSE events into the neutral [`StreamEvent`] vocabulary.
 ///
@@ -403,7 +218,7 @@ impl<H: HttpClient> Provider for AnthropicProvider<H> {
 /// text, thinking, or tool calls (so a `content_block_stop` becomes the matching
 /// `*End` event), and the replay signature accumulated for each thinking block.
 #[derive(Debug, Default)]
-pub(crate) struct AnthropicStreamNormalizer {
+pub struct AnthropicStreamNormalizer {
     /// Input tokens, reported in `message_start`.
     input_tokens: u32,
     /// Output tokens, reported cumulatively in `message_delta`.
@@ -1093,7 +908,7 @@ fn wire_image_source(source: &ImageSource) -> WireImageSource<'_> {
 
 /// The Anthropic response body.
 #[derive(Debug, Deserialize)]
-pub(crate) struct WireResponse {
+pub struct WireResponse {
     #[serde(default)]
     content: Vec<WireContentBlock>,
     stop_reason: Option<String>,
@@ -1181,9 +996,12 @@ fn map_finish_reason(stop_reason: Option<String>) -> FinishReason {
 mod tests {
     use super::*;
     use crate::credential::OAuthTokens;
+    use crate::error::ErrorKind;
     use crate::http::{Method, MockHttpClient};
     use crate::message::{MediaType, Message};
+    use crate::provider::Provider;
     use crate::stream::StreamAccumulator;
+    use crate::token_store::TokenStore;
     use futures_util::StreamExt;
     use std::time::Duration;
 
