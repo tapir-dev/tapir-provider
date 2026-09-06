@@ -19,7 +19,7 @@ inputs:
     required: false
     default: ""
   workspaces:
-    description: "Passed to actions-rust-lang/setup-rust-toolchain as `cache-workspaces`; use when a Cargo workspace is not at the repo root, in the format `path -> target` (for example, `fuzz -> target`)."
+    description: "Passed to actions-rust-lang/setup-rust-toolchain as `cache-workspaces`; use when a Cargo workspace is not at the repo root, in the format `path -> target` (for example, `subcrate -> target`)."
     required: false
     default: ""
 

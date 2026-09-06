@@ -1,11 +1,9 @@
 [workspace]
 # The root crate is the shipped library; `xtask` is a dev-only tool (the model
 # catalog generator). `default-members` keeps `xtask` out of the default build,
-# test, and clippy runs — it is built on demand via `cargo run -p xtask`. `fuzz`
-# stays its own standalone package, excluded from this workspace.
+# test, and clippy runs — it is built on demand via `cargo run -p xtask`.
 members = ["xtask"]
 default-members = ["."]
-exclude = ["fuzz"]
 resolver = "3"
 
 [package]
@@ -14,9 +12,6 @@ version = "0.1.0"
 edition = "2024"
 license = "ISC"
 description = "Library includes models for agentic workflow"
-
-[package.metadata.cargo-machete]
-ignored = ["fuzz"]
 
 [features]
 default = ["reqwest"]
@@ -104,8 +99,16 @@ required-features = ["anthropic"]
 name = "cached_request"
 required-features = ["models", "anthropic"]
 
+# Offline tool-call loop over a scripted Provider; uses only core message/request
+# types, so it needs no crate features. `schemars` (a dev-dependency) derives one
+# tool's argument schema from a typed struct.
+[[example]]
+name = "tools"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Derives a tool's JSON Schema from a typed args struct in the `tools` example.
+schemars = "1.0"
 
 [package.metadata.docs.rs]
 all-features = true
