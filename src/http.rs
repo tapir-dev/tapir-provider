@@ -26,7 +26,7 @@ pub type ByteStream =
 /// Providers report the delay in `delay-seconds` form; the HTTP-date form is not
 /// emitted, so it is not parsed. An absent, non-numeric, or oversized value
 /// yields `None`, letting the retry decorator fall back to its own backoff.
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "deepseek"))]
 pub(crate) fn parse_retry_after(
     headers: &[(String, String)],
 ) -> Option<std::time::Duration> {
@@ -43,7 +43,7 @@ pub(crate) fn parse_retry_after(
 /// The Providers share this so a failed response maps to the same typed error
 /// everywhere, and a `Retry-After` is always honored by the
 /// [`RetryProvider`](crate::retry::RetryProvider).
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "deepseek"))]
 pub(crate) fn error_from_response(response: &HttpResponse) -> Error {
     let error = Error::from_status(response.status, response.body_string());
     match parse_retry_after(&response.headers) {
@@ -432,7 +432,10 @@ mod mock {
 #[cfg(feature = "test-utils")]
 pub use mock::MockHttpClient;
 
-#[cfg(all(test, any(feature = "anthropic", feature = "openai")))]
+#[cfg(all(
+    test,
+    any(feature = "anthropic", feature = "openai", feature = "deepseek")
+))]
 mod retry_after_tests {
     use super::parse_retry_after;
     use std::time::Duration;

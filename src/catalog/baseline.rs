@@ -11,20 +11,28 @@
 //! a parse or schema-version mismatch here is a generator bug, and the loader
 //! treats it as unrecoverable.
 
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(any(
+    feature = "anthropic",
+    feature = "openai",
+    feature = "deepseek"
+))]
 use serde::Deserialize;
 
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(any(
+    feature = "anthropic",
+    feature = "openai",
+    feature = "deepseek"
+))]
 use crate::model::{Model, ModelEntry};
 
 /// The schema version this build expects the embedded files to carry. Kept in
 /// lockstep with the generator (`xtask`); a mismatch means a stale committed file.
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "deepseek"))]
 const SCHEMA_VERSION: u32 = 1;
 
 /// The on-disk shape of a generated baseline file. Extra fields (such as the
 /// human-facing `provider` tag) are ignored.
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "deepseek"))]
 #[derive(Deserialize)]
 struct GeneratedCatalog {
     schema_version: u32,
@@ -40,6 +48,8 @@ pub(super) fn entries() -> Vec<crate::model::ModelEntry> {
     entries.extend(parse(include_str!("../../assets/models/anthropic.json")));
     #[cfg(feature = "openai")]
     entries.extend(parse(include_str!("../../assets/models/openai.json")));
+    #[cfg(feature = "deepseek")]
+    entries.extend(parse(include_str!("../../assets/models/deepseek.json")));
     entries
 }
 
@@ -48,7 +58,7 @@ pub(super) fn entries() -> Vec<crate::model::ModelEntry> {
 /// The input is generated, committed data, not runtime input: a parse failure or
 /// a schema-version mismatch is a build-the-world bug in the generation pipeline,
 /// so this panics rather than degrading to an empty Catalog.
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "deepseek"))]
 fn parse(raw: &str) -> Vec<ModelEntry> {
     let catalog: GeneratedCatalog = serde_json::from_str(raw)
         .expect("embedded baseline catalog must parse; run `just gen-models`");
@@ -103,5 +113,27 @@ mod openai_tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);
+    }
+}
+
+#[cfg(all(test, feature = "deepseek"))]
+mod deepseek_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_deepseek_baseline_parses_and_is_populated() {
+        let entries = parse(include_str!("../../assets/models/deepseek.json"));
+        assert!(!entries.is_empty());
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.model.provider.as_str() == "deepseek")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.model.id.as_str() == "deepseek-chat")
+        );
+        assert!(entries.iter().all(|e| e.model.context_window > 0));
     }
 }

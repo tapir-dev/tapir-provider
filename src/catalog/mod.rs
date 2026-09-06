@@ -438,6 +438,10 @@ fn provider_auth_headers(
     if provider_id == crate::providers::openai::INFO.id.as_str() {
         return Some(crate::providers::openai::auth_headers(credential));
     }
+    #[cfg(feature = "deepseek")]
+    if provider_id == crate::providers::deepseek::INFO.id.as_str() {
+        return Some(crate::providers::deepseek::auth_headers(credential));
+    }
     let _ = credential;
     None
 }
@@ -514,6 +518,16 @@ pub fn create_provider<H: HttpClient + 'static>(
             crate::providers::OpenAIProvider::new(transport, credential, model)
                 .with_base_url(entry.model.base_url.clone())
                 .with_headers(entry.model.headers.iter().cloned());
+        return Ok(Arc::new(provider));
+    }
+
+    #[cfg(feature = "deepseek")]
+    if provider_id == crate::providers::deepseek::INFO.id.as_str() {
+        let provider = crate::providers::DeepSeekProvider::new(
+            transport, credential, model,
+        )
+        .with_base_url(entry.model.base_url.clone())
+        .with_headers(entry.model.headers.iter().cloned());
         return Ok(Arc::new(provider));
     }
 
@@ -778,6 +792,64 @@ mod openai_build_tests {
     }
 }
 
+#[cfg(all(test, feature = "deepseek", feature = "test-utils"))]
+mod deepseek_build_tests {
+    use super::*;
+    use crate::http::MockHttpClient;
+    use crate::message::Message;
+    use crate::request::{CompletionOptions, Context};
+    use crate::token_store::InMemoryTokenStore;
+
+    const SAMPLE_RESPONSE: &str = r#"{
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "hi"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_cache_miss_tokens": 1, "completion_tokens": 1}
+    }"#;
+
+    #[tokio::test]
+    async fn create_provider_builds_a_live_deepseek_provider() {
+        let store = Arc::new(InMemoryTokenStore::new());
+        store
+            .set("deepseek", Credential::api_key("sk-deepseek"))
+            .unwrap();
+        let registry = ModelRegistry::load(Some(store.clone()), None).unwrap();
+        let http =
+            Arc::new(MockHttpClient::with_response(200, SAMPLE_RESPONSE));
+
+        let provider = registry
+            .create_provider("deepseek", "deepseek-chat", http.clone())
+            .unwrap();
+
+        let response = provider
+            .complete(
+                &Context::new(vec![Message::user("hello")]),
+                &CompletionOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text_content(), "hi");
+
+        // The resolved key reached the wire on the Bearer lane, and the entry's
+        // base URL drove the request.
+        let sent = http.last_request();
+        assert!(sent.url.starts_with("https://api.deepseek.com"));
+        let bearer =
+            ("authorization".to_owned(), "Bearer sk-deepseek".to_owned());
+        assert!(sent.headers.contains(&bearer));
+
+        // Auth inspection reports exactly what the Provider sent.
+        let reported = provider_auth_headers(
+            "deepseek",
+            &Credential::api_key("sk-deepseek"),
+        )
+        .unwrap();
+        assert_eq!(reported, vec![bearer]);
+    }
+}
+
 // The fetched layer, exercised end to end: a `refresh` fetches over a VCR
 // cassette, persists the cache, and a fresh `load` reads it back — first from the
 // on-disk cache, then over a replayed refresh that never touches the network.
@@ -930,7 +1002,10 @@ mod fetch_tests {
 // A build with the Catalog on but no Provider feature: the baseline is empty,
 // so there is nothing to load, find, or build. Reachable only when every
 // Provider feature is off.
-#[cfg(all(test, not(any(feature = "anthropic", feature = "openai"))))]
+#[cfg(all(
+    test,
+    not(any(feature = "anthropic", feature = "openai", feature = "deepseek"))
+))]
 mod empty_tests {
     use super::*;
 

@@ -50,6 +50,8 @@ const ENTRIES: &[ProviderInfo] = &[
     crate::providers::anthropic::INFO,
     #[cfg(feature = "openai")]
     crate::providers::openai::INFO,
+    #[cfg(feature = "deepseek")]
+    crate::providers::deepseek::INFO,
 ];
 
 /// The compiled-in catalog of available [`Provider`](crate::Provider)s.
@@ -132,8 +134,31 @@ mod openai_tests {
     }
 }
 
-// Enabling both provider features registers both Providers; enabling only one
-// registers only that one. The `--all-features` run enables both and exercises
+#[cfg(all(test, feature = "deepseek"))]
+mod deepseek_tests {
+    use super::*;
+
+    #[test]
+    fn deepseek_is_compiled_in_and_resolves_by_id() {
+        assert!(Registry::provider_ids().contains(&"deepseek"));
+        assert_eq!(
+            Registry::resolve("deepseek").unwrap().id.as_str(),
+            "deepseek"
+        );
+        // Matching is case-insensitive.
+        assert_eq!(
+            Registry::resolve("DeepSeek").unwrap().id.as_str(),
+            "deepseek"
+        );
+        assert_eq!(
+            Registry::resolve("deepseek").unwrap().api_key_env,
+            "DEEPSEEK_API_KEY"
+        );
+    }
+}
+
+// Enabling several provider features registers each Provider; enabling only one
+// registers only that one. The `--all-features` run enables all and exercises
 // this; a single-feature run exercises the exclusive arms.
 #[cfg(test)]
 mod registration_tests {
@@ -144,13 +169,17 @@ mod registration_tests {
         let ids = Registry::provider_ids();
         assert_eq!(cfg!(feature = "anthropic"), ids.contains(&"anthropic"));
         assert_eq!(cfg!(feature = "openai"), ids.contains(&"openai"));
+        assert_eq!(cfg!(feature = "deepseek"), ids.contains(&"deepseek"));
     }
 }
 
 // A build with no Provider feature enabled: the Registry is empty and no name
 // resolves. Only reachable when every Provider feature is off, so the default
 // `--all-features` test run skips it; a `--no-default-features` run exercises it.
-#[cfg(all(test, not(any(feature = "anthropic", feature = "openai"))))]
+#[cfg(all(
+    test,
+    not(any(feature = "anthropic", feature = "openai", feature = "deepseek"))
+))]
 mod empty_tests {
     use super::*;
 

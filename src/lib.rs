@@ -47,7 +47,7 @@
 #![forbid(unsafe_code)]
 
 /// Shared base64 encoder, compiled only for the Providers that inline image bytes.
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "deepseek"))]
 mod base64;
 
 pub mod auth;
@@ -63,7 +63,7 @@ pub mod message;
 pub mod model;
 /// The Wire Adapter seam and the shared Completion Pipeline harness a Provider
 /// is built from. Compiled with the Providers that will migrate onto it.
-#[cfg(any(feature = "anthropic", feature = "openai"))]
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "deepseek"))]
 mod pipeline;
 pub mod provider;
 pub mod providers;
@@ -122,3 +122,6 @@ pub use providers::{AnthropicBuilder, AnthropicProvider};
 
 #[cfg(feature = "openai")]
 pub use providers::{OpenAIBuilder, OpenAIEmbeddingProvider, OpenAIProvider};
+
+#[cfg(feature = "deepseek")]
+pub use providers::{DeepSeekBuilder, DeepSeekProvider};

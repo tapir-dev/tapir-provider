@@ -21,6 +21,11 @@ reqwest = ["dep:reqwest"]
 anthropic = ["dep:getrandom"]
 # Compile the OpenAI Provider and embeddings into the crate.
 openai = []
+# Compile the DeepSeek Provider into the crate. DeepSeek speaks the OpenAI Chat
+# Completions protocol, so this reuses the OpenAI request builder (see ADR-0011);
+# it does not imply the `openai` feature — the reused builder is `pub(crate)` and
+# compiled whenever any Provider on the Completion Pipeline is enabled.
+deepseek = []
 # Umbrella feature for the model catalog's type layer: Model, Model Entry,
 # Compat, and the catalog enums. Off by default; the ModelId/ProviderId
 # newtypes are always compiled because the Registry's ProviderInfo carries a

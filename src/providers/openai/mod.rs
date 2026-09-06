@@ -477,8 +477,13 @@ impl OpenAIStreamNormalizer {
 }
 
 /// The OpenAI Chat Completions request body as sent on the wire.
+///
+/// `pub(crate)` so a sibling Provider speaking the same protocol (DeepSeek) can
+/// reuse this request builder while supplying its own response half; see
+/// ADR-0011. The fields stay private — callers construct it through
+/// [`from_context`](Self::from_context) and serialize it.
 #[derive(Debug, Serialize)]
-struct WireRequest<'a> {
+pub(crate) struct WireRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -507,7 +512,7 @@ struct WireStreamOptions {
 }
 
 impl<'a> WireRequest<'a> {
-    fn from_context(
+    pub(crate) fn from_context(
         model: &'a str,
         ctx: &'a Context,
         opts: &'a CompletionOptions,
