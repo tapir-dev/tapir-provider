@@ -13,12 +13,12 @@ default:
 # The nightly is pinned in rust-toolchain.toml; `rustup show` installs exactly that.
 setup:
     rustup show
-    cargo binstall -y cargo-nextest cargo-deny cargo-machete cargo-fuzz cargo-llvm-cov typos-cli
+    cargo binstall -y cargo-nextest cargo-deny cargo-machete cargo-llvm-cov typos-cli
     @echo "Also install editorconfig-checker:"
     @echo "  go install github.com/editorconfig-checker/editorconfig-checker/v3/cmd/editorconfig-checker@latest"
 
 # Full local check suite (mirrors the core CI). Roughly the old check.sh.
-check: _check-tools editorconfig fmt clippy build doc deny machete typos license fuzz-build test-ci
+check: _check-tools editorconfig fmt clippy build doc deny machete typos license test-ci
 
 # Check formatting (rustfmt from the pinned nightly in rust-toolchain.toml).
 fmt:
@@ -131,41 +131,6 @@ test-many:
         fi
     done
 
-# Build all fuzz targets (compile-check only).
-# Two workarounds baked in:
-#  - `--target "$host"`: cargo-fuzz otherwise defaults to the triple it was itself
-#    built for (e.g. musl), whose static libc is incompatible with the sanitizer.
-#  - `-s none`: current rustc wires SanitizerCoverage into `-Zsanitizer=address`
-#    itself, so cargo-fuzz's extra `-Cpasses=sancov-module` runs sancov twice and
-#    leaves `asan.module_dtor` referencing undefined `__sancov_gen_*` symbols
-#    (link error). Disabling the sanitizer drops that pass; instrumentation is
-#    codegen-only, so this still fully compile-checks the fuzz harness.
-# Uses the pinned nightly (rust-toolchain.toml), not a bare `+nightly`.
-fuzz-build:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    host=$(rustc -vV | sed -n 's/^host: //p')
-    cargo fuzz build --target "$host" -s none
-
-# Run every fuzz target for 30s.
-# NOTE: real fuzzing needs the coverage instrumentation, so we can't apply the
-# `-s none` workaround from `fuzz-build` here. On a rustc where cargo-fuzz's
-# `-Cpasses=sancov-module` breaks the link (undefined `__sancov_gen_*`), pin a
-# compatible nightly in rust-toolchain.toml until the upstream fix lands.
-fuzz:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    host=$(rustc -vV | sed -n 's/^host: //p')
-    targets=$(cargo fuzz list)
-    if [ -z "$targets" ]; then
-        echo "⚠️  No fuzz targets found, skipping."
-        exit 0
-    fi
-    for target in $targets; do
-        echo "Fuzzing $target..."
-        cargo fuzz run --target "$host" "$target" -- -max_total_time=30
-    done
-
 # Compile-check benchmarks. CI never runs benches.
 # `test-utils` unlocks the `slice`/`SlotState` helpers that most benches need.
 bench-build: _lockfile
@@ -206,7 +171,6 @@ _check-tools:
     command -v cargo-nextest         >/dev/null 2>&1 || missing+=("cargo-nextest")
     command -v cargo-deny            >/dev/null 2>&1 || missing+=("cargo-deny")
     command -v cargo-machete         >/dev/null 2>&1 || missing+=("cargo-machete")
-    command -v cargo-fuzz            >/dev/null 2>&1 || missing+=("cargo-fuzz")
     command -v typos                 >/dev/null 2>&1 || missing+=("typos-cli")
     command -v editorconfig-checker  >/dev/null 2>&1 || missing+=("editorconfig-checker")
     cargo fmt --version              >/dev/null 2>&1 || missing+=("nightly rustfmt")

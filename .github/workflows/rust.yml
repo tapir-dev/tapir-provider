@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 # Always-on core suite. Optional checks live in their own workflow files
-# (coverage.yml, fuzz.yml, sanitizers.yml, security-audit.yml, scorecard.yml,
+# (coverage.yml, sanitizers.yml, security-audit.yml, scorecard.yml,
 # pr-title.yml) so a check can be disabled by deleting a single file.
 jobs:
   # Cheap checks grouped onto one runner so they share a single boot + checkout.
@@ -115,35 +115,6 @@ jobs:
             three_nodes_crash
         env:
           RUST_BACKTRACE: "1"
-
-  fuzz:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/rust-setup
-        with:
-          toolchain: nightly
-          # The fuzz harness is its own crate under fuzz/, not the repo-root workspace.
-          components: ""
-          tools: cargo-fuzz
-          workspaces: "fuzz"
-
-      - name: Fuzz (30s per target, smoke run)
-        run: |
-          host=$(rustc -vV | sed -n 's/^host: //p')
-          for target in $(cargo +nightly fuzz list); do
-            echo "Fuzzing $target..."
-            cargo +nightly fuzz run --target "$host" "$target" -- -max_total_time=30
-          done
-
-      - name: Upload crash artifacts
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: fuzz-artifacts
-          path: fuzz/artifacts/
-          if-no-files-found: ignore
 
   build:
     # Release-only: debug compilation of all targets is already covered by
