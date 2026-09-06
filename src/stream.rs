@@ -12,12 +12,17 @@
 //! [`AssistantMessage`] the non-streaming path would produce.
 
 use crate::error::Error;
+#[cfg(any(feature = "anthropic", feature = "openai"))]
 use crate::http::ByteStream;
 use crate::message::{AssistantMessage, ContentPart};
 use crate::response::{FinishReason, Usage, mint_call_id};
+#[cfg(any(feature = "anthropic", feature = "openai"))]
 use crate::sse::{SseDecoder, SseEvent};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+use std::collections::VecDeque;
 use std::pin::Pin;
+#[cfg(any(feature = "anthropic", feature = "openai"))]
 use std::task::Poll;
 
 /// A boxed, ordered stream of [`StreamEvent`]s returned by a streaming Provider.
@@ -122,6 +127,7 @@ pub enum StreamEvent {
 /// self`. Everything else in the streaming pipeline — reassembling events off
 /// the byte chunks, buffering the ones a single chunk expands into, propagating
 /// transport errors — lives in [`SseEventStream`] and does not vary by Provider.
+#[cfg(any(feature = "anthropic", feature = "openai"))]
 pub(crate) trait StreamNormalizer {
     /// Map one decoded SSE event to zero or more neutral [`StreamEvent`]s.
     fn normalize(&mut self, event: &SseEvent) -> Vec<StreamEvent>;
@@ -137,6 +143,7 @@ pub(crate) trait StreamNormalizer {
 /// normalizer is the only part that varies by Provider, so it is injected: each
 /// Provider hands in its own, and a test can drive the pipeline with a scripted
 /// one.
+#[cfg(any(feature = "anthropic", feature = "openai"))]
 pub(crate) struct SseEventStream<N> {
     /// The response body, streamed as byte chunks.
     bytes: ByteStream,
@@ -150,6 +157,7 @@ pub(crate) struct SseEventStream<N> {
     finished: bool,
 }
 
+#[cfg(any(feature = "anthropic", feature = "openai"))]
 impl<N: StreamNormalizer> SseEventStream<N> {
     /// Drive `normalizer` over the SSE events decoded from `bytes`.
     pub(crate) fn new(bytes: ByteStream, normalizer: N) -> Self {
@@ -163,6 +171,7 @@ impl<N: StreamNormalizer> SseEventStream<N> {
     }
 }
 
+#[cfg(any(feature = "anthropic", feature = "openai"))]
 impl<N: StreamNormalizer + Unpin> futures_core::Stream for SseEventStream<N> {
     type Item = Result<StreamEvent, Error>;
 
@@ -626,8 +635,10 @@ mod tests {
     /// A scripted [`StreamNormalizer`] mapping each decoded [`SseEvent`] to a
     /// single [`StreamEvent::TextDelta`] carrying its `data`, so a test reads the
     /// reassembled events straight off the driver's output.
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
     struct EchoNormalizer;
 
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
     impl StreamNormalizer for EchoNormalizer {
         fn normalize(&mut self, event: &SseEvent) -> Vec<StreamEvent> {
             vec![StreamEvent::TextDelta {
@@ -639,6 +650,7 @@ mod tests {
 
     /// Drive the pipeline over `chunks`, returning the `data` payloads the driver
     /// surfaced as text deltas.
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
     async fn drive(chunks: Vec<Result<Vec<u8>, Error>>) -> Vec<String> {
         use futures_util::StreamExt;
         let bytes: ByteStream = futures_util::stream::iter(chunks).boxed();
@@ -651,6 +663,7 @@ mod tests {
             .await
     }
 
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
     #[tokio::test]
     async fn driver_reassembles_chunk_split_events_and_flushes_the_final_one() {
         // The first event straddles two chunks; the last carries no terminating
@@ -664,6 +677,7 @@ mod tests {
         assert_eq!(texts, vec!["hello".to_owned(), "world".to_owned()]);
     }
 
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
     #[tokio::test]
     async fn driver_yields_decoded_events_then_propagates_a_transport_error() {
         use crate::error::ErrorKind;
