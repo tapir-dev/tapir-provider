@@ -62,9 +62,9 @@ pub mod http;
 pub mod message;
 pub mod model;
 /// The Wire Adapter seam and the shared Completion Pipeline harness a Provider
-/// is built from. Compiled with the Providers that will migrate onto it.
+/// is built from. Compiled with the Providers that ride it.
 #[cfg(any(feature = "anthropic", feature = "openai"))]
-mod pipeline;
+pub mod pipeline;
 pub mod provider;
 pub mod providers;
 pub mod registry;

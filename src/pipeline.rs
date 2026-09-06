@@ -18,15 +18,18 @@
 //! extra headers).
 
 use crate::credential::Credential;
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 use crate::http::{HttpClient, HttpRequest, Method};
 use crate::message::AssistantMessage;
 use crate::provider::Provider;
+use crate::registry::ProviderInfo;
 use crate::request::{CompletionOptions, Context};
 use crate::stream::{SseEventStream, StreamEvents, StreamNormalizer};
+use crate::token_store::{TokenStore, resolve};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::marker::PhantomData;
 
 /// Whether a request opts into a streamed (SSE) response.
 ///
@@ -36,7 +39,7 @@ use std::fmt;
 /// (`Off`) and `complete_stream` (`On`) and hands it to the adapter's body
 /// builder, so no adapter re-decides it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Streaming {
+pub enum Streaming {
     /// Request an incremental SSE response.
     On,
     /// Request a single buffered response.
@@ -45,7 +48,7 @@ pub(crate) enum Streaming {
 
 impl Streaming {
     /// Whether streaming is requested, as the wire `stream` flag.
-    pub(crate) const fn enabled(self) -> bool {
+    pub const fn enabled(self) -> bool {
         matches!(self, Self::On)
     }
 }
@@ -63,7 +66,7 @@ impl Streaming {
 ///
 /// It is monomorphized into `CompletionPipeline`, not held as a trait object,
 /// so it carries associated types freely and need not be object-safe.
-pub(crate) trait WireAdapter: Send + Sync {
+pub trait WireAdapter: Send + Sync {
     /// The Provider's buffered response body, decoded from the successful
     /// response before it is mapped into an [`AssistantMessage`].
     type Response: DeserializeOwned;
@@ -71,6 +74,25 @@ pub(crate) trait WireAdapter: Send + Sync {
     /// The `StreamNormalizer` that maps this Provider's SSE events into the
     /// neutral stream vocabulary.
     type Normalizer: StreamNormalizer + Unpin + Send + 'static;
+
+    /// The Provider's canonical key: the Token Store key its Credential is
+    /// stored under, and the identity the shared constructors resolve against.
+    const PROVIDER_KEY: &'static str;
+
+    /// The environment variable holding this Provider's API key, the
+    /// last-resort Credential the shared constructors fall back to.
+    const API_KEY_ENV: &'static str;
+
+    /// The default base URL the endpoint path is appended to, absent an override.
+    const DEFAULT_BASE_URL: &'static str;
+
+    /// The Provider's human-facing name, used in the "no Credential" resolution
+    /// error the shared constructors raise.
+    const DISPLAY_NAME: &'static str;
+
+    /// This Provider's [`ProviderInfo`] in the Model Registry — its canonical
+    /// id, aliases, and API-key environment variable.
+    const INFO: ProviderInfo;
 
     /// The endpoint path appended to the base URL, leading slash included
     /// (for example `/v1/messages`).
@@ -131,7 +153,7 @@ pub(crate) trait WireAdapter: Send + Sync {
 /// streamed `complete_stream` without repeating the send, the success gate, the
 /// error classification, the double-decode, or the stream-driver wrap.
 #[derive(Clone)]
-pub(crate) struct CompletionPipeline<H, A> {
+pub struct CompletionPipeline<H, A> {
     /// The transport all wire I/O flows through.
     http: H,
     /// The adapter supplying the Provider's wire specifics.
@@ -175,7 +197,11 @@ impl<H: fmt::Debug, A: fmt::Debug> fmt::Debug for CompletionPipeline<H, A> {
 impl<H, A> CompletionPipeline<H, A> {
     /// Build a pipeline over `adapter`, authenticating with `credential` and
     /// addressing `model` at `base_url`, with no extra headers.
-    pub(crate) fn new(
+    ///
+    /// The low-level constructor that takes the adapter value directly; the
+    /// public [`new`](Self::new) reads the adapter's identity to supply the
+    /// adapter and the default base URL.
+    pub(crate) fn from_adapter(
         http: H,
         adapter: A,
         credential: Credential,
@@ -194,7 +220,7 @@ impl<H, A> CompletionPipeline<H, A> {
 
     /// Override the base URL the endpoint path is appended to.
     #[must_use]
-    pub(crate) fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
@@ -202,7 +228,7 @@ impl<H, A> CompletionPipeline<H, A> {
     /// Append a single extra header sent with every request, after the adapter's
     /// own auth headers.
     #[must_use]
-    pub(crate) fn with_header(
+    pub fn with_header(
         mut self,
         name: impl Into<String>,
         value: impl Into<String>,
@@ -214,12 +240,177 @@ impl<H, A> CompletionPipeline<H, A> {
     /// Append extra headers sent with every request, after the adapter's own
     /// auth headers.
     #[must_use]
-    pub(crate) fn with_headers(
+    pub fn with_headers(
         mut self,
         headers: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         self.extra_headers.extend(headers);
         self
+    }
+}
+
+impl<H: HttpClient, A: WireAdapter + Default> CompletionPipeline<H, A> {
+    /// Build a Provider for the given Model, authenticating with `credential`
+    /// over the injected transport.
+    ///
+    /// The explicit `credential` is resolution's top tier, so this routes it
+    /// through the same [`resolve`] rule every construction path uses: an
+    /// explicit argument never consults the store or environment, so this is
+    /// infallible. The adapter and the default base URL come from the adapter's
+    /// own identity.
+    pub fn new(
+        http: H,
+        credential: Credential,
+        model: impl Into<String>,
+    ) -> Self {
+        let credential =
+            resolve(Some(credential), None, A::PROVIDER_KEY, A::API_KEY_ENV)
+                .ok()
+                .flatten()
+                .expect("an explicit Credential always resolves");
+        Self::from_adapter(
+            http,
+            A::default(),
+            credential,
+            model,
+            A::DEFAULT_BASE_URL,
+        )
+    }
+
+    /// Build a Provider by resolving its Credential from a Token Store, then the
+    /// adapter's API-key environment variable.
+    ///
+    /// Precedence follows [`resolve`]: an `explicit` Credential wins, else the
+    /// `store` under the adapter's key, else the environment. When every tier is
+    /// empty this is an [`Authentication`](crate::ErrorKind::Authentication)
+    /// error rather than a Provider that cannot authenticate any request.
+    pub fn resolve(
+        http: H,
+        model: impl Into<String>,
+        explicit: Option<Credential>,
+        store: Option<&dyn TokenStore>,
+    ) -> Result<Self, Error> {
+        let credential =
+            resolve(explicit, store, A::PROVIDER_KEY, A::API_KEY_ENV)?
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Authentication,
+                        format!(
+                            "no {} Credential: pass one, store it under {:?}, or set {}",
+                            A::DISPLAY_NAME,
+                            A::PROVIDER_KEY,
+                            A::API_KEY_ENV,
+                        ),
+                    )
+                })?;
+        Ok(Self::new(http, credential, model))
+    }
+
+    /// Start a typed [`CompletionBuilder`] over the injected transport for the
+    /// given Model.
+    ///
+    /// The builder layers the advanced knobs — an explicit Credential, a
+    /// base-URL override, and extra headers — over the same Credential
+    /// resolution [`resolve`](Self::resolve) uses.
+    #[must_use]
+    pub fn builder(
+        http: H,
+        model: impl Into<String>,
+    ) -> CompletionBuilder<H, A> {
+        CompletionBuilder::new(http, model)
+    }
+}
+
+/// A typed builder for a [`CompletionPipeline`] with advanced configuration.
+///
+/// It gathers an injected transport, the Model, and the optional knobs — an
+/// explicit Credential, a base-URL override, and extra headers — then
+/// [`build`](Self::build)s a Provider, resolving the Credential through the same
+/// precedence [`CompletionPipeline::resolve`] uses (explicit, then the adapter's
+/// API-key environment variable).
+#[derive(Clone)]
+pub struct CompletionBuilder<H, A> {
+    http: H,
+    model: String,
+    credential: Option<Credential>,
+    base_url: Option<String>,
+    headers: Vec<(String, String)>,
+    /// The adapter whose identity the build resolves against; carried only as a
+    /// type, never as a value.
+    adapter: PhantomData<fn() -> A>,
+}
+
+impl<H: fmt::Debug, A> fmt::Debug for CompletionBuilder<H, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionBuilder")
+            .field("http", &self.http)
+            .field("model", &self.model)
+            .field("credential", &self.credential)
+            .field("base_url", &self.base_url)
+            .field("headers", &redacted_headers(&self.headers))
+            .finish()
+    }
+}
+
+impl<H, A> CompletionBuilder<H, A> {
+    /// Start a builder over the injected transport for the given Model.
+    #[must_use]
+    pub fn new(http: H, model: impl Into<String>) -> Self {
+        Self {
+            http,
+            model: model.into(),
+            credential: None,
+            base_url: None,
+            headers: Vec::new(),
+            adapter: PhantomData,
+        }
+    }
+
+    /// Authenticate with an explicit Credential, the top tier of resolution.
+    #[must_use]
+    pub fn credential(mut self, credential: Credential) -> Self {
+        self.credential = Some(credential);
+        self
+    }
+
+    /// Override the base URL (for proxies, gateways, or a test server).
+    #[must_use]
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Append an extra header sent with every request.
+    #[must_use]
+    pub fn header(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+}
+
+impl<H: HttpClient, A: WireAdapter + Default> CompletionBuilder<H, A> {
+    /// Resolve the Credential and build the Provider.
+    ///
+    /// Credential precedence follows [`resolve`]: the explicit
+    /// [`credential`](Self::credential) if set, else the adapter's API-key
+    /// environment variable. An empty result is an
+    /// [`Authentication`](crate::ErrorKind::Authentication) error.
+    pub fn build(self) -> Result<CompletionPipeline<H, A>, Error> {
+        let mut provider = CompletionPipeline::<H, A>::resolve(
+            self.http,
+            self.model,
+            self.credential,
+            None,
+        )?;
+        if let Some(base_url) = self.base_url {
+            provider = provider.with_base_url(base_url);
+        }
+        provider = provider.with_headers(self.headers);
+        Ok(provider)
     }
 }
 
@@ -353,12 +544,22 @@ mod tests {
     /// A minimal `WireAdapter` that drives both pipeline paths end to end: it
     /// pins an endpoint, an `x-fake-key` auth header, a body echoing the Model and
     /// the streaming flag, and a text-only response mapping.
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct FakeAdapter;
 
     impl WireAdapter for FakeAdapter {
         type Response = FakeResponse;
         type Normalizer = FakeNormalizer;
+
+        const PROVIDER_KEY: &'static str = "fake";
+        const API_KEY_ENV: &'static str = "FAKE_API_KEY";
+        const DEFAULT_BASE_URL: &'static str = "https://fake.test";
+        const DISPLAY_NAME: &'static str = "Fake";
+        const INFO: ProviderInfo = ProviderInfo {
+            id: crate::model::ProviderId::from_static("fake"),
+            aliases: &[],
+            api_key_env: "FAKE_API_KEY",
+        };
 
         fn endpoint(&self) -> &str {
             "/v1/fake"
@@ -413,12 +614,11 @@ mod tests {
     fn pipeline(
         http: Arc<MockHttpClient>,
     ) -> CompletionPipeline<Arc<MockHttpClient>, FakeAdapter> {
+        // The identity-driven constructor reads the adapter's default base URL.
         CompletionPipeline::new(
             http,
-            FakeAdapter,
             Credential::api_key("sk-fake"),
             "fake-model",
-            "https://fake.test",
         )
     }
 

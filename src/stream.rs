@@ -121,8 +121,8 @@ pub enum StreamEvent {
 /// reason, which content-block indices have opened) across calls via `&mut
 /// self`. Everything else in the streaming pipeline — reassembling events off
 /// the byte chunks, buffering the ones a single chunk expands into, propagating
-/// transport errors — lives in [`SseEventStream`] and does not vary by Provider.
-pub(crate) trait StreamNormalizer {
+/// transport errors — lives in `SseEventStream` and does not vary by Provider.
+pub trait StreamNormalizer {
     /// Map one decoded SSE event to zero or more neutral [`StreamEvent`]s.
     fn normalize(&mut self, event: &SseEvent) -> Vec<StreamEvent>;
 }
